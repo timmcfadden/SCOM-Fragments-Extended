@@ -1,0 +1,693 @@
+﻿<ManagementPackFragment SchemaVersion="2.0" xmlns:xsd="http://www.w3.org/2001/XMLSchema">
+<!--
+%%
+Description:
+  A CLASS and DISCOVERY and MONITOR and PERFORMANCE COLLECTION RULE which share a SINGLE PowerShell data source across ALL discovered instances using COOKDOWN
+  One scheduled PowerShell script runs per agent, returns one propertybag PER INSTANCE, and every monitor and rule for every instance is fed from that single execution
+  The example discovers one instance per subfolder found under a base folder, and collects the number of files in each instance folder as a numeric metric
+  CompanyID - is a short abbreviation for your company with NO SPACES OR SPECIAL CHARACTERS ALLOWED
+  AppName - is a short name for your app with NO SPACES OR SPECIAL CHARACTERS ALLOWED
+  UniqueID - We need a Unique ID to reuse the fragment within the same MP.  Use a shortened descriptive name with NO SPACES OR SPECIAL CHARACTERS ALLOWED such as "QueueDepth"
+  BaseFolderPath - the folder scanned by BOTH the discovery and the shared collection script.  Each subfolder becomes one discovered instance.  Example: C:\Demo\Queues
+  IntervalSeconds - how often the SHARED collection script runs.  This value is used by the monitor AND the collection rule and they MUST match for cookdown
+  ObjectName - you can make this up, it is the Performance Object name the collected data is mapped to
+  CounterName - you can make this up, it is the Performance Counter name the collected data is mapped to
+  Threshold - the numeric value which, when EXCEEDED, drives the monitor unhealthy
+  Samples - the number of CONSECUTIVE breaching samples required before the monitor changes state
+
+  HOW COOKDOWN WORKS IN THIS FRAGMENT:
+    The shared data source (##CompanyID##.##AppName##.##UniqueID##.Collection.DS) contains a Scheduler and a PowerShell propertybag probe.
+    Its configuration contains ONLY values that are identical for every instance on an agent (IntervalSeconds, SyncTime, BaseFolderPath, TimeoutSeconds).
+    Nothing instance specific (InstanceName, Threshold, Samples, ObjectName, CounterName) is ever passed into the data source.
+    The script emits one propertybag per instance, each carrying the instance key (InstanceName) and the numeric metric (Value).
+    Each workflow then filters DOWNSTREAM of the shared data source for its own instance using an expression filter on Property[@Name='InstanceName'].
+    Because the expanded module chain (Scheduler + PowerShell probe) and its configuration are byte for byte identical for every workflow,
+    the agent instantiates that chain ONCE and multicasts the output to every monitor and every rule that needs it.
+
+  COOKDOWN BOUNDARIES - READ THIS BEFORE YOU MODIFY THE FRAGMENT:
+    1. Cookdown happens INSIDE A SINGLE HEALTH SERVICE (one agent, one management server, or one gateway).  It NEVER shares a script execution between different agents.
+       Fifty agents each running this MP means fifty script executions per interval - one per agent - no matter how many instances each agent hosts.
+    2. All of the sharing workflows must be loaded in the SAME module host / execution context on that agent.  Isolation="Any" is used here so the agent is free to place them together.
+       Changing Isolation, or adding a RunAs profile to only some of the workflows, puts those workflows in a different execution context and they will NOT share.
+    3. The data source configuration must resolve to the SAME literal string for every workflow.  $Target$ references are resolved BEFORE the comparison, so a
+       $Target/Property[...]$ value that differs per instance in the data source configuration silently defeats cookdown.  Keep all of those downstream.
+    4. Overrides that change DATA SOURCE configuration split the sharing group.  In this fragment those are IntervalSeconds, SyncTime, BaseFolderPath and TimeoutSeconds.
+       Override IntervalSeconds for three instances out of twenty and you get TWO script executions per interval on that agent, not one.
+    5. Overrides that change only DOWNSTREAM configuration are safe and do NOT break cookdown.  In this fragment those are Threshold and Samples on the monitor.
+    6. Disabling the monitor (or the rule) for some instances is safe - those workflows simply stop, the rest keep sharing.  Disabling every sharing workflow stops the script entirely.
+    7. If you change the monitor interval you MUST change the rule interval to the identical value, otherwise the monitor and the rule each run their own copy of the script.
+
+Version: 1.0
+LastModified: 11-Sep-2026
+%%
+
+In this fragment you need to replace:
+  ##CompanyID##
+  ##AppName##
+  ##UniqueID##
+  ##BaseFolderPath##
+  ##IntervalSeconds##
+  ##ObjectName##
+  ##CounterName##
+  ##Threshold##
+  ##Samples##
+
+This fragment depends on references:
+  RequiredReference: Alias="System", ID="System.Library"
+  RequiredReference: Alias="SC", ID="Microsoft.SystemCenter.Library"
+  RequiredReference: Alias="Windows", ID="Microsoft.Windows.Library"
+  RequiredReference: Alias="Health", ID="System.Health.Library"
+  RequiredReference: Alias="Perf", ID="System.Performance.Library"
+  RequiredReference: Alias="MSDL", ID="Microsoft.SystemCenter.DataWarehouse.Library"
+
+@@Author=FragmentLibrary Contributor@@
+-->
+  <TypeDefinitions>
+    <EntityTypes>
+      <ClassTypes>
+        <ClassType ID="##CompanyID##.##AppName##.##UniqueID##.Instance.Class" Base="Windows!Microsoft.Windows.LocalApplication" Accessibility="Public" Abstract="false" Hosted="true" Singleton="false">
+          <Property ID="InstanceName" Type="string" Key="true" CaseSensitive="false" MaxLength="256" MinLength="0" Required="true" />
+          <Property ID="FolderPath" Type="string" Key="false" MaxLength="512" />
+          <!-- We choose Microsoft.Windows.LocalApplication as our generic base class.  It is hosted by Microsoft.Windows.Computer, which gives every instance a stable host -->
+          <!-- InstanceName is the KEY property.  The key plus the host computer form the instance identity, so the key must be stable across discovery cycles -->
+        </ClassType>
+      </ClassTypes>
+    </EntityTypes>
+    <ModuleTypes>
+      <DataSourceModuleType ID="##CompanyID##.##AppName##.##UniqueID##.Instance.Discovery.DS" Accessibility="Internal" Batching="false">
+        <Configuration>
+          <xsd:element minOccurs="1" name="IntervalSeconds" type="xsd:integer" xmlns:xsd="http://www.w3.org/2001/XMLSchema" />
+          <xsd:element minOccurs="0" name="SyncTime" type="xsd:string" xmlns:xsd="http://www.w3.org/2001/XMLSchema" />
+          <xsd:element minOccurs="1" name="BaseFolderPath" type="xsd:string" xmlns:xsd="http://www.w3.org/2001/XMLSchema" />
+          <xsd:element minOccurs="1" name="DebugLogging" type="xsd:boolean" xmlns:xsd="http://www.w3.org/2001/XMLSchema" />
+          <xsd:element minOccurs="1" name="TimeoutSeconds" type="xsd:integer" xmlns:xsd="http://www.w3.org/2001/XMLSchema" />
+        </Configuration>
+        <OverrideableParameters>
+          <OverrideableParameter ID="IntervalSeconds" Selector="$Config/IntervalSeconds$" ParameterType="int" />
+          <OverrideableParameter ID="SyncTime" Selector="$Config/SyncTime$" ParameterType="string" />
+          <OverrideableParameter ID="BaseFolderPath" Selector="$Config/BaseFolderPath$" ParameterType="string" />
+          <OverrideableParameter ID="DebugLogging" Selector="$Config/DebugLogging$" ParameterType="bool" />
+          <OverrideableParameter ID="TimeoutSeconds" Selector="$Config/TimeoutSeconds$" ParameterType="int" />
+        </OverrideableParameters>
+        <ModuleImplementation Isolation="Any">
+          <Composite>
+            <MemberModules>
+              <DataSource ID="DS" TypeID="Windows!Microsoft.Windows.TimedPowerShell.DiscoveryProvider">
+                <IntervalSeconds>$Config/IntervalSeconds$</IntervalSeconds>
+                <SyncTime>$Config/SyncTime$</SyncTime>
+                <ScriptName>##CompanyID##.##AppName##.##UniqueID##.Instance.Discovery.DS.ps1</ScriptName>
+                <ScriptBody>
+#=================================================================================
+#  Discovers one class instance for each subfolder found under a base folder
+#  This is the discovery half of a cookdown example - the collection half returns
+#  one propertybag per instance discovered here, keyed on the same InstanceName
+#
+#  Author:
+#  v1.0
+#=================================================================================
+param($SourceId,$ManagedEntityId,$ComputerName,$MGName,$BaseFolderPath,$DebugLogging)
+
+
+# Manual Testing section - put stuff here for manually testing script - typically parameters:
+#=================================================================================
+# $SourceId = '{00000000-0000-0000-0000-000000000000}'
+# $ManagedEntityId = '{00000000-0000-0000-0000-000000000000}'
+# $ComputerName = "computername.domain.com"
+# $MGName = "MGNAME"
+# $BaseFolderPath = "C:\Demo\Queues"
+# $DebugLogging = "false"
+#=================================================================================
+
+
+# Constants section - modify stuff here:
+#=================================================================================
+# Assign script name variable for use in event logging.
+# ScriptName should be the same as the ID of the module that the script is contained in
+$ScriptName = "##CompanyID##.##AppName##.##UniqueID##.Instance.Discovery.DS.ps1"
+$EventID = "4801"
+#=================================================================================
+
+
+# Starting Script section - All scripts get this
+#=================================================================================
+# Gather the start time of the script
+$StartTime = Get-Date
+#Set variable to be used in logging events
+$whoami = whoami
+# Load MOMScript API
+$momapi = New-Object -comObject MOM.ScriptAPI
+#Log script event that we are starting task
+$momapi.LogScriptEvent($ScriptName,$EventID,0,"`n Script is starting. `n Running as ($whoami). `n Management Group: ($MGName). `n BaseFolderPath: ($BaseFolderPath).")
+#=================================================================================
+
+
+# Discovery Script section - Discovery scripts get this
+#=================================================================================
+# Load SCOM Discovery module
+$DiscoveryData = $momapi.CreateDiscoveryData(0, $SourceId, $ManagedEntityId)
+#=================================================================================
+
+
+# Begin MAIN script section
+#=================================================================================
+# Enumerate the instance folders.  A read failure here must NOT submit an empty snapshot,
+# because an empty snapshot would delete every previously discovered instance on this agent.
+$InstanceFolders = $null
+$ReadFailed = $false
+TRY
+{
+  IF (Test-Path -LiteralPath $BaseFolderPath -PathType Container)
+  {
+    $InstanceFolders = @(Get-ChildItem -LiteralPath $BaseFolderPath -Force -ErrorAction Stop | Where-Object {$_.PSIsContainer -eq $true})
+  }
+  ELSE
+  {
+    # The base folder genuinely does not exist.  This is a valid "nothing is installed here" result and we submit an empty snapshot on purpose.
+    $InstanceFolders = @()
+    $momapi.LogScriptEvent($ScriptName,$EventID,0,"`n BaseFolderPath ($BaseFolderPath) does not exist. Submitting an empty discovery snapshot - no instances on this computer.")
+  }
+}
+CATCH
+{
+  $ReadFailed = $true
+  $momapi.LogScriptEvent($ScriptName,$EventID,1,"`n FATAL ERROR: Unable to enumerate ($BaseFolderPath). `n Error: $($_.Exception.Message) `n NOT submitting discovery data so existing instances are preserved.")
+}
+
+IF ($ReadFailed -eq $true)
+{
+  # Exit WITHOUT returning $DiscoveryData.  Returning an empty snapshot after a read failure would remove healthy objects and close their alerts incorrectly.
+  $EndTime = Get-Date
+  $ScriptTime = ($EndTime - $StartTime).TotalSeconds
+  $momapi.LogScriptEvent($ScriptName,$EventID,1,"`n Script Completed WITHOUT submitting discovery data. `n Script Runtime: ($ScriptTime) seconds.")
+  EXIT
+}
+
+$InstanceCount = 0
+FOREACH ($Folder in $InstanceFolders)
+{
+  [string]$InstanceName = $Folder.Name
+  [string]$FolderPath = $Folder.FullName
+
+  $instance = $DiscoveryData.CreateClassInstance("$MPElement[Name='##CompanyID##.##AppName##.##UniqueID##.Instance.Class']$")
+  $instance.AddProperty("$MPElement[Name='Windows!Microsoft.Windows.Computer']/PrincipalName$", $ComputerName)
+  $instance.AddProperty("$MPElement[Name='##CompanyID##.##AppName##.##UniqueID##.Instance.Class']/InstanceName$", $InstanceName)
+  $instance.AddProperty("$MPElement[Name='##CompanyID##.##AppName##.##UniqueID##.Instance.Class']/FolderPath$", $FolderPath)
+  $instance.AddProperty("$MPElement[Name='System!System.Entity']/DisplayName$", $InstanceName)
+  $DiscoveryData.AddInstance($instance)
+  $InstanceCount++
+
+  IF ($DebugLogging.ToUpper() -eq "TRUE")
+  {
+    $momapi.LogScriptEvent($ScriptName,$EventID,0,"`n DEBUG: Discovered instance ($InstanceName) at ($FolderPath).")
+  }
+}
+
+$momapi.LogScriptEvent($ScriptName,$EventID,0,"`n Discovery script is returning ($InstanceCount) instances from ($BaseFolderPath).")
+
+# Return Discovery Items Normally
+$DiscoveryData
+# Return Discovery Bag to the command line for testing (does not work from ISE)
+# $momapi.Return($DiscoveryData)
+#=================================================================================
+# End MAIN script section
+
+
+# End of script section
+#=================================================================================
+#Log an event for script ending and total execution time.
+$EndTime = Get-Date
+$ScriptTime = ($EndTime - $StartTime).TotalSeconds
+$momapi.LogScriptEvent($ScriptName,$EventID,0,"`n Script Completed. `n Script Runtime: ($ScriptTime) seconds.")
+#=================================================================================
+# End of script
+                </ScriptBody>
+                <Parameters>
+                  <Parameter>
+                    <Name>SourceId</Name>
+                    <Value>$MPElement$</Value>
+                  </Parameter>
+                  <Parameter>
+                    <Name>ManagedEntityId</Name>
+                    <Value>$Target/Id$</Value>
+                  </Parameter>
+                  <Parameter>
+                    <Name>ComputerName</Name>
+                    <Value>$Target/Host/Property[Type="Windows!Microsoft.Windows.Computer"]/PrincipalName$</Value>
+                  </Parameter>
+                  <Parameter>
+                    <Name>MGName</Name>
+                    <Value>$Target/ManagementGroup/Name$</Value>
+                  </Parameter>
+                  <Parameter>
+                    <Name>BaseFolderPath</Name>
+                    <Value>$Config/BaseFolderPath$</Value>
+                  </Parameter>
+                  <Parameter>
+                    <Name>DebugLogging</Name>
+                    <Value>$Config/DebugLogging$</Value>
+                  </Parameter>
+                </Parameters>
+                <TimeoutSeconds>$Config/TimeoutSeconds$</TimeoutSeconds>
+              </DataSource>
+            </MemberModules>
+            <Composition>
+              <Node ID="DS" />
+            </Composition>
+          </Composite>
+        </ModuleImplementation>
+        <OutputType>System!System.Discovery.Data</OutputType>
+      </DataSourceModuleType>
+      <DataSourceModuleType ID="##CompanyID##.##AppName##.##UniqueID##.Collection.DS" Accessibility="Internal" Batching="false">
+        <!-- THIS IS THE SHARED (COOKED DOWN) DATA SOURCE.  Every monitor and every collection rule for every instance uses THIS module with THIS configuration. -->
+        <!-- DO NOT add instance specific configuration here.  Anything added here that differs per instance will break cookdown and multiply the script executions. -->
+        <Configuration>
+          <xsd:element minOccurs="1" name="IntervalSeconds" type="xsd:integer" xmlns:xsd="http://www.w3.org/2001/XMLSchema" />
+          <xsd:element minOccurs="0" name="SyncTime" type="xsd:string" xmlns:xsd="http://www.w3.org/2001/XMLSchema" />
+          <xsd:element minOccurs="1" name="BaseFolderPath" type="xsd:string" xmlns:xsd="http://www.w3.org/2001/XMLSchema" />
+          <xsd:element minOccurs="1" name="TimeoutSeconds" type="xsd:integer" xmlns:xsd="http://www.w3.org/2001/XMLSchema" />
+        </Configuration>
+        <OverrideableParameters>
+          <!-- Every parameter exposed here changes the SHARED data source configuration.  Overriding any of them for a SUBSET of instances creates a second sharing group. -->
+          <OverrideableParameter ID="IntervalSeconds" Selector="$Config/IntervalSeconds$" ParameterType="int" />
+          <OverrideableParameter ID="SyncTime" Selector="$Config/SyncTime$" ParameterType="string" />
+          <OverrideableParameter ID="BaseFolderPath" Selector="$Config/BaseFolderPath$" ParameterType="string" />
+          <OverrideableParameter ID="TimeoutSeconds" Selector="$Config/TimeoutSeconds$" ParameterType="int" />
+        </OverrideableParameters>
+        <ModuleImplementation Isolation="Any">
+          <Composite>
+            <MemberModules>
+              <DataSource ID="Scheduler" TypeID="System!System.Scheduler">
+                <Scheduler>
+                  <SimpleReccuringSchedule>
+                    <Interval Unit="Seconds">$Config/IntervalSeconds$</Interval>
+                    <SyncTime>$Config/SyncTime$</SyncTime>
+                  </SimpleReccuringSchedule>
+                  <ExcludeDates />
+                </Scheduler>
+              </DataSource>
+              <ProbeAction ID="PA" TypeID="Windows!Microsoft.Windows.PowerShellPropertyBagTriggerOnlyProbe">
+                <ScriptName>##CompanyID##.##AppName##.##UniqueID##.Collection.DS.ps1</ScriptName>
+                <ScriptBody>
+#=================================================================================
+#  SHARED (cooked down) collection script
+#  Runs ONCE per agent per interval and returns ONE propertybag PER INSTANCE
+#  Each propertybag carries:
+#    InstanceName - the stable instance key, identical to the discovery key property
+#    Value        - the numeric metric for that instance
+#  Downstream expression filters in each monitor and each rule pick out their own instance
+#
+#  Author:
+#  v1.0
+#=================================================================================
+param([string]$BaseFolderPath)
+
+
+# Manual Testing section - put stuff here for manually testing script - typically parameters:
+#=================================================================================
+# [string]$BaseFolderPath = "C:\Demo\Queues"
+#=================================================================================
+
+
+# Constants section - modify stuff here:
+#=================================================================================
+# Assign script name variable for use in event logging.
+$ScriptName = "##CompanyID##.##AppName##.##UniqueID##.Collection.DS.ps1"
+$EventID = "4802"
+#=================================================================================
+
+
+# Starting Script section - All scripts get this
+#=================================================================================
+# Gather the start time of the script
+$StartTime = Get-Date
+#Set variable to be used in logging events
+$whoami = whoami
+# Load MOMScript API
+$momapi = New-Object -comObject MOM.ScriptAPI
+#=================================================================================
+
+
+# Begin MAIN script section
+#=================================================================================
+# NOTE: we deliberately do NOT create the propertybag here.  One bag is created PER INSTANCE inside the loop below.
+
+$InstanceFolders = @()
+TRY
+{
+  IF (Test-Path -LiteralPath $BaseFolderPath -PathType Container)
+  {
+    $InstanceFolders = @(Get-ChildItem -LiteralPath $BaseFolderPath -Force -ErrorAction Stop | Where-Object {$_.PSIsContainer -eq $true})
+  }
+  ELSE
+  {
+    $momapi.LogScriptEvent($ScriptName,$EventID,1,"`n ERROR: BaseFolderPath ($BaseFolderPath) does not exist. Returning no propertybags - every monitor fed by this script keeps its previous state.")
+  }
+}
+CATCH
+{
+  $momapi.LogScriptEvent($ScriptName,$EventID,1,"`n FATAL ERROR: Unable to enumerate ($BaseFolderPath). `n Error: $($_.Exception.Message) `n Returning no propertybags - every monitor fed by this script keeps its previous state.")
+}
+
+# We never emit a fake numeric value on failure.  A bag with a made up value would silently drive every monitor healthy.
+# Emitting nothing leaves each monitor in its previous state and leaves a gap in the performance data, which is honest and visible.
+
+[int]$BagCount = 0
+[string]$Summary = ""
+FOREACH ($Folder in $InstanceFolders)
+{
+  [string]$InstanceName = $Folder.Name
+  TRY
+  {
+    # This is the metric.  Replace this block with whatever numeric value your application exposes for one instance.
+    [double]$Value = @(Get-ChildItem -LiteralPath $Folder.FullName -Force -ErrorAction Stop | Where-Object {$_.PSIsContainer -eq $false}).Count
+  }
+  CATCH
+  {
+    $momapi.LogScriptEvent($ScriptName,$EventID,1,"`n ERROR: Unable to read instance ($InstanceName) at ($($Folder.FullName)). `n Error: $($_.Exception.Message) `n Skipping this instance for this cycle.")
+    CONTINUE
+  }
+
+  # One propertybag per instance.  CreatePropertyBag must be called inside the loop or every instance overwrites the last.
+  $bag = $momapi.CreatePropertyBag()
+  $bag.AddValue('InstanceName',$InstanceName)
+  $bag.AddValue('Value',$Value)
+  $bag
+  $BagCount++
+  $Summary = $Summary + "`n  ($InstanceName) = ($Value)"
+}
+
+$momapi.LogScriptEvent($ScriptName,$EventID,0,"`n Shared collection script returned ($BagCount) propertybags from ($BaseFolderPath). `n Running as ($whoami). $Summary")
+#=================================================================================
+# End MAIN script section
+
+
+# End of script section
+#=================================================================================
+#Log an event for script ending and total execution time.
+$EndTime = Get-Date
+$ScriptTime = ($EndTime - $StartTime).TotalSeconds
+$momapi.LogScriptEvent($ScriptName,$EventID,0,"`n Script Completed. `n Script Runtime: ($ScriptTime) seconds.")
+#=================================================================================
+# End of script
+                </ScriptBody>
+                <Parameters>
+                  <Parameter>
+                    <Name>BaseFolderPath</Name>
+                    <Value>$Config/BaseFolderPath$</Value>
+                  </Parameter>
+                </Parameters>
+                <TimeoutSeconds>$Config/TimeoutSeconds$</TimeoutSeconds>
+              </ProbeAction>
+            </MemberModules>
+            <Composition>
+              <Node ID="PA">
+                <Node ID="Scheduler" />
+              </Node>
+            </Composition>
+          </Composite>
+        </ModuleImplementation>
+        <OutputType>System!System.PropertyBagData</OutputType>
+      </DataSourceModuleType>
+      <ConditionDetectionModuleType ID="##CompanyID##.##AppName##.##UniqueID##.InstanceFilterAndPerfMapper.CD" Accessibility="Internal" Batching="false" Stateful="false" PassThrough="false">
+        <!-- A Rule may only contain a SINGLE ConditionDetection element, so the per instance filter and the performance mapper are combined into one composite condition detection -->
+        <Configuration>
+          <xsd:element minOccurs="1" name="InstanceName" type="xsd:string" xmlns:xsd="http://www.w3.org/2001/XMLSchema" />
+          <xsd:element minOccurs="1" name="ObjectName" type="xsd:string" xmlns:xsd="http://www.w3.org/2001/XMLSchema" />
+          <xsd:element minOccurs="1" name="CounterName" type="xsd:string" xmlns:xsd="http://www.w3.org/2001/XMLSchema" />
+        </Configuration>
+        <ModuleImplementation Isolation="Any">
+          <Composite>
+            <MemberModules>
+              <ConditionDetection ID="InstanceFilter" TypeID="System!System.ExpressionFilter">
+                <Expression>
+                  <SimpleExpression>
+                    <ValueExpression>
+                      <XPathQuery Type="String">Property[@Name='InstanceName']</XPathQuery>
+                    </ValueExpression>
+                    <Operator>Equal</Operator>
+                    <ValueExpression>
+                      <Value Type="String">$Config/InstanceName$</Value>
+                    </ValueExpression>
+                  </SimpleExpression>
+                </Expression>
+              </ConditionDetection>
+              <ConditionDetection ID="PerfMapper" TypeID="Perf!System.Performance.DataGenericMapper">
+                <ObjectName>$Config/ObjectName$</ObjectName>
+                <CounterName>$Config/CounterName$</CounterName>
+                <InstanceName>$Config/InstanceName$</InstanceName>
+                <Value>$Data/Property[@Name='Value']$</Value>
+              </ConditionDetection>
+            </MemberModules>
+            <Composition>
+              <Node ID="PerfMapper">
+                <Node ID="InstanceFilter" />
+              </Node>
+            </Composition>
+          </Composite>
+        </ModuleImplementation>
+        <OutputType>Perf!System.Performance.Data</OutputType>
+        <InputTypes>
+          <InputType>System!System.PropertyBagData</InputType>
+        </InputTypes>
+      </ConditionDetectionModuleType>
+    </ModuleTypes>
+    <MonitorTypes>
+      <UnitMonitorType ID="##CompanyID##.##AppName##.##UniqueID##.Threshold.MonitorType" Accessibility="Internal">
+        <MonitorTypeStates>
+          <MonitorTypeState ID="ThresholdNotBreached" NoDetection="false" />
+          <MonitorTypeState ID="ThresholdBreached" NoDetection="false" />
+        </MonitorTypeStates>
+        <Configuration>
+          <!-- The first four elements are passed STRAIGHT THROUGH to the shared data source and must stay identical across every instance for cookdown -->
+          <xsd:element minOccurs="1" name="IntervalSeconds" type="xsd:integer" xmlns:xsd="http://www.w3.org/2001/XMLSchema" />
+          <xsd:element minOccurs="0" name="SyncTime" type="xsd:string" xmlns:xsd="http://www.w3.org/2001/XMLSchema" />
+          <xsd:element minOccurs="1" name="BaseFolderPath" type="xsd:string" xmlns:xsd="http://www.w3.org/2001/XMLSchema" />
+          <xsd:element minOccurs="1" name="TimeoutSeconds" type="xsd:integer" xmlns:xsd="http://www.w3.org/2001/XMLSchema" />
+          <!-- These three are used DOWNSTREAM of the shared data source only.  Overriding them is cookdown safe -->
+          <xsd:element minOccurs="1" name="InstanceName" type="xsd:string" xmlns:xsd="http://www.w3.org/2001/XMLSchema" />
+          <xsd:element minOccurs="1" name="Threshold" type="xsd:double" xmlns:xsd="http://www.w3.org/2001/XMLSchema" />
+          <xsd:element minOccurs="1" name="Samples" type="xsd:integer" xmlns:xsd="http://www.w3.org/2001/XMLSchema" />
+        </Configuration>
+        <OverrideableParameters>
+          <!-- COOKDOWN BREAKING when overridden for a subset of instances -->
+          <OverrideableParameter ID="IntervalSeconds" Selector="$Config/IntervalSeconds$" ParameterType="int" />
+          <OverrideableParameter ID="SyncTime" Selector="$Config/SyncTime$" ParameterType="string" />
+          <OverrideableParameter ID="BaseFolderPath" Selector="$Config/BaseFolderPath$" ParameterType="string" />
+          <OverrideableParameter ID="TimeoutSeconds" Selector="$Config/TimeoutSeconds$" ParameterType="int" />
+          <!-- COOKDOWN SAFE - these only affect modules downstream of the shared data source -->
+          <OverrideableParameter ID="Threshold" Selector="$Config/Threshold$" ParameterType="double" />
+          <OverrideableParameter ID="Samples" Selector="$Config/Samples$" ParameterType="int" />
+        </OverrideableParameters>
+        <MonitorImplementation>
+          <MemberModules>
+            <DataSource ID="DS" TypeID="##CompanyID##.##AppName##.##UniqueID##.Collection.DS">
+              <IntervalSeconds>$Config/IntervalSeconds$</IntervalSeconds>
+              <SyncTime>$Config/SyncTime$</SyncTime>
+              <BaseFolderPath>$Config/BaseFolderPath$</BaseFolderPath>
+              <TimeoutSeconds>$Config/TimeoutSeconds$</TimeoutSeconds>
+            </DataSource>
+            <ConditionDetection ID="ThresholdNotBreachedFilter" TypeID="System!System.ExpressionFilter">
+              <Expression>
+                <And>
+                  <Expression>
+                    <SimpleExpression>
+                      <ValueExpression>
+                        <XPathQuery Type="String">Property[@Name='InstanceName']</XPathQuery>
+                      </ValueExpression>
+                      <Operator>Equal</Operator>
+                      <ValueExpression>
+                        <Value Type="String">$Config/InstanceName$</Value>
+                      </ValueExpression>
+                    </SimpleExpression>
+                  </Expression>
+                  <Expression>
+                    <SimpleExpression>
+                      <ValueExpression>
+                        <XPathQuery Type="Double">Property[@Name='Value']</XPathQuery>
+                      </ValueExpression>
+                      <Operator>LessEqual</Operator>
+                      <ValueExpression>
+                        <Value Type="Double">$Config/Threshold$</Value>
+                      </ValueExpression>
+                    </SimpleExpression>
+                  </Expression>
+                </And>
+              </Expression>
+            </ConditionDetection>
+            <ConditionDetection ID="ThresholdBreachedFilter" TypeID="System!System.ExpressionFilter">
+              <Expression>
+                <And>
+                  <Expression>
+                    <SimpleExpression>
+                      <ValueExpression>
+                        <XPathQuery Type="String">Property[@Name='InstanceName']</XPathQuery>
+                      </ValueExpression>
+                      <Operator>Equal</Operator>
+                      <ValueExpression>
+                        <Value Type="String">$Config/InstanceName$</Value>
+                      </ValueExpression>
+                    </SimpleExpression>
+                  </Expression>
+                  <Expression>
+                    <SimpleExpression>
+                      <ValueExpression>
+                        <XPathQuery Type="Double">Property[@Name='Value']</XPathQuery>
+                      </ValueExpression>
+                      <Operator>Greater</Operator>
+                      <ValueExpression>
+                        <Value Type="Double">$Config/Threshold$</Value>
+                      </ValueExpression>
+                    </SimpleExpression>
+                  </Expression>
+                </And>
+              </Expression>
+              <SuppressionSettings>
+                <MatchCount>$Config/Samples$</MatchCount>
+              </SuppressionSettings>
+            </ConditionDetection>
+            <!-- Value LessEqual Threshold and Value Greater Threshold are exhaustive and mutually exclusive for every numeric value, so no sample is ever unhandled and no two states can both match -->
+          </MemberModules>
+          <RegularDetections>
+            <RegularDetection MonitorTypeStateID="ThresholdNotBreached">
+              <Node ID="ThresholdNotBreachedFilter">
+                <Node ID="DS" />
+              </Node>
+            </RegularDetection>
+            <RegularDetection MonitorTypeStateID="ThresholdBreached">
+              <Node ID="ThresholdBreachedFilter">
+                <Node ID="DS" />
+              </Node>
+            </RegularDetection>
+          </RegularDetections>
+          <!-- There is deliberately no OnDemandDetection.  An on demand (recalculate health) detection would have to run the script outside the shared schedule and would not be cooked down -->
+        </MonitorImplementation>
+      </UnitMonitorType>
+    </MonitorTypes>
+  </TypeDefinitions>
+  <Monitoring>
+    <Discoveries>
+      <Discovery ID="##CompanyID##.##AppName##.##UniqueID##.Instance.Discovery" Target="Windows!Microsoft.Windows.Server.OperatingSystem" Enabled="true" ConfirmDelivery="false" Remotable="true" Priority="Normal">
+      <!-- We choose Microsoft.Windows.Server.OperatingSystem as the preferred target class to ensure this will run on all Windows Servers, but will not create duplicates on clusters -->
+        <Category>Discovery</Category>
+        <DiscoveryTypes>
+          <DiscoveryClass TypeID="##CompanyID##.##AppName##.##UniqueID##.Instance.Class">
+            <Property PropertyID="InstanceName" />
+            <Property PropertyID="FolderPath" />
+          </DiscoveryClass>
+        </DiscoveryTypes>
+        <DataSource ID="DS" TypeID="##CompanyID##.##AppName##.##UniqueID##.Instance.Discovery.DS">
+          <IntervalSeconds>14400</IntervalSeconds>  <!-- 4 hours.  A new instance folder is monitored within one discovery cycle, and a removed folder is deleted from SCOM on the next cycle -->
+          <SyncTime></SyncTime>
+          <BaseFolderPath>##BaseFolderPath##</BaseFolderPath>
+          <DebugLogging>false</DebugLogging>
+          <TimeoutSeconds>120</TimeoutSeconds>
+        </DataSource>
+      </Discovery>
+    </Discoveries>
+    <Rules>
+      <Rule ID="##CompanyID##.##AppName##.##UniqueID##.Collection.Rule" Enabled="true" Target="##CompanyID##.##AppName##.##UniqueID##.Instance.Class" ConfirmDelivery="false" Remotable="true" Priority="Normal" DiscardLevel="100">
+        <Category>PerformanceCollection</Category>
+        <DataSources>
+          <DataSource ID="DS" TypeID="##CompanyID##.##AppName##.##UniqueID##.Collection.DS">
+            <!-- THESE FOUR VALUES MUST BE IDENTICAL TO THE MONITOR CONFIGURATION BELOW OR THE RULE AND THE MONITOR WILL EACH RUN THEIR OWN COPY OF THE SCRIPT -->
+            <IntervalSeconds>##IntervalSeconds##</IntervalSeconds>
+            <SyncTime></SyncTime>
+            <BaseFolderPath>##BaseFolderPath##</BaseFolderPath>
+            <TimeoutSeconds>120</TimeoutSeconds>
+          </DataSource>
+        </DataSources>
+        <ConditionDetection ID="CD" TypeID="##CompanyID##.##AppName##.##UniqueID##.InstanceFilterAndPerfMapper.CD">
+          <InstanceName>$Target/Property[Type="##CompanyID##.##AppName##.##UniqueID##.Instance.Class"]/InstanceName$</InstanceName>
+          <ObjectName>##ObjectName##</ObjectName>
+          <CounterName>##CounterName##</CounterName>
+        </ConditionDetection>
+        <WriteActions>
+          <WriteAction ID="WriteToDB" TypeID="SC!Microsoft.SystemCenter.CollectPerformanceData" />  <!-- Collect this data to the Operations Database -->
+          <WriteAction ID="WriteToDW" TypeID="MSDL!Microsoft.SystemCenter.DataWarehouse.PublishPerformanceData" />  <!-- Collect this data to the Data Warehouse Database -->
+        </WriteActions>
+      </Rule>
+    </Rules>
+    <Monitors>
+      <UnitMonitor ID="##CompanyID##.##AppName##.##UniqueID##.Threshold.Monitor" Accessibility="Public" Enabled="true" Target="##CompanyID##.##AppName##.##UniqueID##.Instance.Class" ParentMonitorID="Health!System.Health.PerformanceState" Remotable="true" Priority="Normal" TypeID="##CompanyID##.##AppName##.##UniqueID##.Threshold.MonitorType" ConfirmDelivery="false">
+        <Category>PerformanceHealth</Category>
+        <AlertSettings AlertMessage="##CompanyID##.##AppName##.##UniqueID##.Threshold.Monitor.AlertMessage">
+          <AlertOnState>Warning</AlertOnState>  <!-- Warning or Error should match OperationalStates below -->
+          <AutoResolve>true</AutoResolve>
+          <AlertPriority>Normal</AlertPriority>
+          <AlertSeverity>MatchMonitorHealth</AlertSeverity>  <!-- Common options for AlertSeverity are MatchMonitorHealth, Information, Warning, Error -->
+          <AlertParameters>
+            <AlertParameter1>$Data/Context/Property[@Name='InstanceName']$</AlertParameter1>
+            <AlertParameter2>$Data/Context/Property[@Name='Value']$</AlertParameter2>
+            <AlertParameter3>$Target/Host/Property[Type="Windows!Microsoft.Windows.Computer"]/PrincipalName$</AlertParameter3>
+          </AlertParameters>
+        </AlertSettings>
+        <OperationalStates>
+          <OperationalState ID="ThresholdNotBreached" MonitorTypeStateID="ThresholdNotBreached" HealthState="Success" />
+          <OperationalState ID="ThresholdBreached" MonitorTypeStateID="ThresholdBreached" HealthState="Warning" />  <!-- HealthState = Warning or Error -->
+        </OperationalStates>
+        <Configuration>
+          <!-- THESE FOUR VALUES MUST BE IDENTICAL TO THE RULE CONFIGURATION ABOVE OR THE RULE AND THE MONITOR WILL EACH RUN THEIR OWN COPY OF THE SCRIPT -->
+          <IntervalSeconds>##IntervalSeconds##</IntervalSeconds>
+          <SyncTime></SyncTime>
+          <BaseFolderPath>##BaseFolderPath##</BaseFolderPath>
+          <TimeoutSeconds>120</TimeoutSeconds>
+          <!-- Instance specific configuration lives here, DOWNSTREAM of the shared data source -->
+          <InstanceName>$Target/Property[Type="##CompanyID##.##AppName##.##UniqueID##.Instance.Class"]/InstanceName$</InstanceName>
+          <Threshold>##Threshold##</Threshold>  <!-- Value GREATER than this is unhealthy.  Value LESS THAN OR EQUAL TO this is healthy -->
+          <Samples>##Samples##</Samples>  <!-- Number of consecutive breaching samples required before the monitor changes state -->
+        </Configuration>
+      </UnitMonitor>
+    </Monitors>
+  </Monitoring>
+  <Presentation>
+    <StringResources>
+      <StringResource ID="##CompanyID##.##AppName##.##UniqueID##.Threshold.Monitor.AlertMessage" />
+    </StringResources>
+  </Presentation>
+  <LanguagePacks>
+    <LanguagePack ID="ENU" IsDefault="true">
+      <DisplayStrings>
+        <!-- Classes -->
+        <DisplayString ElementID="##CompanyID##.##AppName##.##UniqueID##.Instance.Class">
+          <Name>##CompanyID## ##AppName## ##UniqueID## Instance</Name>
+          <Description />
+        </DisplayString>
+        <DisplayString ElementID="##CompanyID##.##AppName##.##UniqueID##.Instance.Class" SubElementID="InstanceName">
+          <Name>Instance Name</Name>
+        </DisplayString>
+        <DisplayString ElementID="##CompanyID##.##AppName##.##UniqueID##.Instance.Class" SubElementID="FolderPath">
+          <Name>Folder Path</Name>
+        </DisplayString>
+        <!-- Discoveries -->
+        <DisplayString ElementID="##CompanyID##.##AppName##.##UniqueID##.Instance.Discovery">
+          <Name>##CompanyID## ##AppName## ##UniqueID## Instance Discovery</Name>
+          <Description />
+        </DisplayString>
+        <!-- Rules -->
+        <DisplayString ElementID="##CompanyID##.##AppName##.##UniqueID##.Collection.Rule">
+          <Name>##CompanyID## ##AppName## ##UniqueID## Shared Script Performance Collection Rule</Name>
+          <Description />
+        </DisplayString>
+        <!-- Monitors -->
+        <DisplayString ElementID="##CompanyID##.##AppName##.##UniqueID##.Threshold.Monitor">
+          <Name>##CompanyID## ##AppName## ##UniqueID## Threshold Monitor</Name>
+          <Description />
+        </DisplayString>
+        <DisplayString ElementID="##CompanyID##.##AppName##.##UniqueID##.Threshold.Monitor" SubElementID="ThresholdNotBreached">
+          <Name>Threshold Not Breached</Name>
+        </DisplayString>
+        <DisplayString ElementID="##CompanyID##.##AppName##.##UniqueID##.Threshold.Monitor" SubElementID="ThresholdBreached">
+          <Name>Threshold Breached</Name>
+        </DisplayString>
+        <DisplayString ElementID="##CompanyID##.##AppName##.##UniqueID##.Threshold.Monitor.AlertMessage">
+          <Name>##CompanyID## ##AppName## ##UniqueID## has breached a threshold</Name>
+          <Description>The shared collection script reported a value above the configured threshold.
+
+Instance: {0}
+Value: {1}
+Computer: {2}</Description>
+        </DisplayString>
+      </DisplayStrings>
+    </LanguagePack>
+  </LanguagePacks>
+</ManagementPackFragment>

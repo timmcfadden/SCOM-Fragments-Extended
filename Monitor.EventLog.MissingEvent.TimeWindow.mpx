@@ -1,0 +1,208 @@
+﻿<ManagementPackFragment SchemaVersion="2.0" xmlns:xsd="http://www.w3.org/2001/XMLSchema">
+<!--
+%%
+Description:
+  A MONITOR which becomes UNHEALTHY when an EXPECTED event does NOT appear in an event log within a rolling time window, and returns to HEALTHY as soon as a matching event arrives
+  This is the classic "the nightly job writes event 4711 when it finishes - tell me when it stops doing that" monitor
+  It uses the NATIVE SCOM monitor type Microsoft.Windows.MissingEventLogSingleEventLog2StateMonitorType.  No script is involved
+  CompanyID - is a short abbreviation for your company with NO SPACES OR SPECIAL CHARACTERS ALLOWED
+  AppName - is a short name for your app with NO SPACES OR SPECIAL CHARACTERS ALLOWED
+  ClassID - is the targeted class such as your custom class or Windows!Microsoft.Windows.Server.OperatingSystem
+  LogName - is the Event Log Name to watch (System, Application, Operations Manager, etc)
+  EventID - is a SINGLE event ID for an explicit EQUALS match on the EXPECTED event
+  EventSource - is a string based Event Source for an explicit EQUALS match on the EXPECTED event
+  IntervalSeconds - is the length of the missing event window in seconds.  If no matching event is seen during a window the monitor goes unhealthy
+
+  HOW THE NATIVE MONITOR TYPE IS WIRED:
+    Healthy path   : Microsoft.Windows.BaseEventProvider (LogName) -> System.ExpressionFilter (Expression) -> state EventRaised
+    Unhealthy path : Microsoft.Windows.BaseEventProvider (MissingLogName) -> System.ExpressionFilter (MissingExpression) -> System.MissingConsolidatorCondition (Consolidator) -> state MissingEventRaised
+    Both paths watch the SAME event criteria.  The healthy path fires the instant a matching event is written.
+    The unhealthy path counts matching events inside a window and emits a data item when the window closes; the monitor type's built in filter then tests Count Equal 0.
+    Because Expression and MissingExpression describe the same event, this fragment keeps them identical.  Change both together or the monitor will never recover.
+
+  WINDOW SEMANTICS - THIS IS A ROLLING FIXED LENGTH WINDOW, NOT A CALENDAR DEADLINE:
+    CountMode is OnNewItemNOP_OnTimerOutputRestart.  In that mode an arriving event only increments the counter - it does NOT restart the window.  The window restarts when its timer expires.
+    So the windows are consecutive fixed length intervals anchored on when the workflow was loaded, not on when the last event arrived.
+    Practical consequence: after the last matching event, the monitor turns unhealthy somewhere between 1x and 2x IntervalSeconds later.
+      Worst case is an event that arrives at the very start of window N and nothing after it - window N still counts 1 and stays healthy, and only window N+1 reports Count 0.
+      If that latency matters, set IntervalSeconds to roughly half of the longest gap you are willing to tolerate.
+    THIS FRAGMENT CANNOT EXPRESS "the job must have finished by 06:00".  TimeControl does accept a GenericSchedule instead of WithinTimeSchedule, which is how you would build a calendar aligned window,
+      but the behaviour, the daylight saving handling and the restart semantics of that variant are different and it is deliberately not what this fragment does.  Do not claim calendar behaviour from this configuration.
+
+  STARTUP GRACE:
+    There is exactly one window of implicit grace.  The first window starts when the workflow is loaded, so the earliest possible unhealthy verdict is IntervalSeconds (plus Latency) after load.
+    A workflow is loaded when the agent health service starts, when the management pack is imported or changed, when an override on this monitor changes, and when the agent receives new configuration.
+    That means every configuration change silently grants another full window of grace.  Frequent overrides on a short interval monitor can therefore delay detection.
+
+  TIMER RESET BEHAVIOUR:
+    The window timer is reset ONLY by the timer expiring, by the workflow being reloaded, or by the agent restarting.  Receiving a matching event does not reset it.
+    Latency (default 60 seconds) is how long the consolidator keeps a closed window open for late arriving data items before it emits its result, so the real world verdict lands about IntervalSeconds + Latency after the window opened.
+    DrainWait (default 120 seconds) is how long the module waits for in flight data during shutdown.  Both are exposed in the configuration below so you can tune them.
+
+  BEHAVIOUR AFTER AN AGENT OR WORKFLOW RESTART:
+    Monitor STATE is persisted by the health service, so a monitor that was unhealthy before the restart is still unhealthy after it, and its alert is still open.
+    The consolidator WINDOW is not persisted - it starts over.  Any events counted in the partial window before the restart are lost.
+    Recovery still works normally: the first matching event after the restart drives the monitor healthy immediately, because the healthy path does not go through the consolidator.
+    If the monitor was unhealthy and the expected event never comes back, the next window that closes with Count 0 simply re-asserts the same unhealthy state.
+    A brand new agent, or a newly discovered object, starts in the Healthy state and gets the one window of startup grace described above.
+
+  LIMITATIONS OF THE NATIVE MODULE THAT YOU SHOULD KNOW ABOUT:
+    1. No calendar or business hours awareness - see WINDOW SEMANTICS above.
+    2. No suppression of the unhealthy verdict during a planned maintenance gap.  Use SCOM maintenance mode on the target object instead.
+    3. The unhealthy data item is a System.ConsolidatorData item with Count 0, so there is no event to quote in the alert.  The alert context therefore carries the window boundaries and the count, plus the criteria from the display string.
+    4. The event must be written to the log the agent actually reads.  A remote log is not supported by this configuration - ComputerName is "." for the local computer.
+
+Version: 1.0
+LastModified: 11-Sep-2026
+%%
+
+In this fragment you need to replace:
+  ##CompanyID##
+  ##AppName##
+  ##ClassID##
+  ##LogName##
+  ##EventID##
+  ##EventSource##
+  ##IntervalSeconds##
+
+This fragment depends on references:
+  RequiredReference: Alias="Windows", ID="Microsoft.Windows.Library"
+  RequiredReference: Alias="Health", ID="System.Health.Library"
+  (System.Library is not referenced directly by this fragment - the ExpressionType schema used by the inline expressions is pulled in by the native monitor type itself)
+
+@@Author=FragmentLibrary Contributor@@
+-->
+  <Monitoring>
+    <Monitors>
+      <UnitMonitor ID="##CompanyID##.##AppName##.MissingEvent.##EventID##.Alert.Monitor" Accessibility="Public" Enabled="true" Target="##ClassID##" ParentMonitorID="Health!System.Health.AvailabilityState" Remotable="true" Priority="Normal" TypeID="Windows!Microsoft.Windows.MissingEventLogSingleEventLog2StateMonitorType" ConfirmDelivery="true">
+        <Category>Custom</Category>
+        <AlertSettings AlertMessage="##CompanyID##.##AppName##.MissingEvent.##EventID##.Alert.Monitor.AlertMessage">
+          <AlertOnState>Error</AlertOnState>
+          <AutoResolve>true</AutoResolve>  <!-- The alert closes automatically when a matching event arrives and drives the monitor back to Healthy -->
+          <AlertPriority>Normal</AlertPriority>
+          <AlertSeverity>Error</AlertSeverity>
+          <AlertParameters>
+            <!-- The unhealthy data item is System.ConsolidatorData.  Count is always 0 here by definition, and the two timestamps show exactly which window was empty -->
+            <AlertParameter1>$Data/Context/TimeWindowStart$</AlertParameter1>
+            <AlertParameter2>$Data/Context/TimeWindowEnd$</AlertParameter2>
+            <AlertParameter3>$Data/Context/Count$</AlertParameter3>
+          </AlertParameters>
+        </AlertSettings>
+        <OperationalStates>
+          <OperationalState ID="EventRaised" MonitorTypeStateID="EventRaised" HealthState="Success" />
+          <OperationalState ID="MissingEventRaised" MonitorTypeStateID="MissingEventRaised" HealthState="Error" />
+        </OperationalStates>
+        <Configuration>
+          <!-- HEALTHY PATH - a matching event arriving here returns the monitor to Healthy immediately, with no window and no counting involved -->
+          <ComputerName>.</ComputerName>
+          <LogName>##LogName##</LogName>
+          <Expression>
+            <And>
+              <Expression>
+                <SimpleExpression>
+                  <ValueExpression>
+                    <XPathQuery Type="UnsignedInteger">EventDisplayNumber</XPathQuery>
+                  </ValueExpression>
+                  <Operator>Equal</Operator>
+                  <ValueExpression>
+                    <Value Type="UnsignedInteger">##EventID##</Value>
+                  </ValueExpression>
+                </SimpleExpression>
+              </Expression>
+              <Expression>
+                <SimpleExpression>
+                  <ValueExpression>
+                    <XPathQuery Type="String">PublisherName</XPathQuery>
+                  </ValueExpression>
+                  <Operator>Equal</Operator>
+                  <ValueExpression>
+                    <Value Type="String">##EventSource##</Value>
+                  </ValueExpression>
+                </SimpleExpression>
+              </Expression>
+            </And>
+          </Expression>
+          <!-- UNHEALTHY PATH - the SAME criteria, counted inside the window.  Keep these identical to the healthy path above -->
+          <MissingComputerName>.</MissingComputerName>
+          <MissingLogName>##LogName##</MissingLogName>
+          <MissingExpression>
+            <And>
+              <Expression>
+                <SimpleExpression>
+                  <ValueExpression>
+                    <XPathQuery Type="UnsignedInteger">EventDisplayNumber</XPathQuery>
+                  </ValueExpression>
+                  <Operator>Equal</Operator>
+                  <ValueExpression>
+                    <Value Type="UnsignedInteger">##EventID##</Value>
+                  </ValueExpression>
+                </SimpleExpression>
+              </Expression>
+              <Expression>
+                <SimpleExpression>
+                  <ValueExpression>
+                    <XPathQuery Type="String">PublisherName</XPathQuery>
+                  </ValueExpression>
+                  <Operator>Equal</Operator>
+                  <ValueExpression>
+                    <Value Type="String">##EventSource##</Value>
+                  </ValueExpression>
+                </SimpleExpression>
+              </Expression>
+            </And>
+          </MissingExpression>
+          <Consolidator>
+            <ConsolidationProperties />  <!-- Empty: every matching event counts towards the same window.  Add a PropertyXPathQuery here only if you want a separate window per event property value -->
+            <TimeControl>
+              <Latency>60</Latency>  <!-- Seconds the consolidator keeps a closed window open for late arriving events.  The unhealthy verdict lands about IntervalSeconds + Latency after the window opened -->
+              <DrainWait>120</DrainWait>  <!-- Seconds the module waits for in flight data during shutdown -->
+              <WithinTimeSchedule>
+                <Interval>##IntervalSeconds##</Interval>  <!-- The rolling missing event window in SECONDS.  Detection happens between 1x and 2x this value after the last matching event -->
+              </WithinTimeSchedule>
+            </TimeControl>
+            <CountingCondition>
+              <Count>1</Count>  <!-- Not used to decide when to emit in this CountMode.  The window always emits when its timer expires, and the monitor type then tests Count Equal 0 -->
+              <CountMode>OnNewItemNOP_OnTimerOutputRestart</CountMode>  <!-- OnNewItem: just count.  OnTimer: emit the window result and restart.  This is the only CountMode that can ever report a count of zero -->
+            </CountingCondition>
+          </Consolidator>
+        </Configuration>
+      </UnitMonitor>
+    </Monitors>
+  </Monitoring>
+  <Presentation>
+    <StringResources>
+      <StringResource ID="##CompanyID##.##AppName##.MissingEvent.##EventID##.Alert.Monitor.AlertMessage" />
+    </StringResources>
+  </Presentation>
+  <LanguagePacks>
+    <LanguagePack ID="ENU" IsDefault="true">
+      <DisplayStrings>
+        <DisplayString ElementID="##CompanyID##.##AppName##.MissingEvent.##EventID##.Alert.Monitor">
+          <Name>##CompanyID## ##AppName## Missing Event ##EventID## Monitor</Name>
+          <Description>Becomes unhealthy when event ##EventID## from source ##EventSource## is not written to the ##LogName## log within ##IntervalSeconds## seconds. Returns to healthy as soon as a matching event is written.</Description>
+        </DisplayString>
+        <DisplayString ElementID="##CompanyID##.##AppName##.MissingEvent.##EventID##.Alert.Monitor" SubElementID="EventRaised">
+          <Name>Expected Event Raised</Name>
+        </DisplayString>
+        <DisplayString ElementID="##CompanyID##.##AppName##.MissingEvent.##EventID##.Alert.Monitor" SubElementID="MissingEventRaised">
+          <Name>Expected Event Missing</Name>
+        </DisplayString>
+        <DisplayString ElementID="##CompanyID##.##AppName##.MissingEvent.##EventID##.Alert.Monitor.AlertMessage">
+          <Name>##CompanyID## ##AppName## expected event ##EventID## was not logged</Name>
+          <Description>The expected event was not written during the monitored time window.
+
+Expected event ID: ##EventID##
+Expected event source: ##EventSource##
+Event log: ##LogName##
+Window length (seconds): ##IntervalSeconds##
+
+Window start: {0}
+Window end: {1}
+Matching events counted in the window: {2}
+
+This alert closes automatically the next time a matching event is written.</Description>
+        </DisplayString>
+      </DisplayStrings>
+    </LanguagePack>
+  </LanguagePacks>
+</ManagementPackFragment>

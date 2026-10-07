@@ -1,0 +1,573 @@
+﻿<ManagementPackFragment SchemaVersion="2.0" xmlns:xsd="http://www.w3.org/2001/XMLSchema">
+<!--
+%%
+Description:
+  A reusable three state MONITOR which runs a timed PowerShell script, produces ONE NUMERIC value in a propertybag, and compares it against an overrideable warning and critical threshold
+  It supports both "higher is worse" and "lower is worse" measurements, requires a configurable number of consecutive samples before it degrades, and never reports a collection problem as healthy
+  Replace the clearly marked MEASUREMENT BLOCK in the script with whatever you need to measure.  Everything else is generic
+  CompanyID - is a short abbreviation for your company with NO SPACES OR SPECIAL CHARACTERS ALLOWED
+  AppName - is a short name for your app with NO SPACES OR SPECIAL CHARACTERS ALLOWED
+  ClassID - is the targeted class such as your custom class or Windows!Microsoft.Windows.Server.OperatingSystem
+  UniqueID - Is a unique short description of the monitor purpose (NO SPACES OR SPECIAL CHARACTERS ALLOWED) such as "SystemDriveFreePercent"
+  IntervalSeconds - how often the script runs
+  Direction - HigherIsWorse or LowerIsWorse.  See CONFIGURATION EXAMPLES below
+  WarningThreshold - the numeric value at which the monitor degrades to Warning
+  CriticalThreshold - the numeric value at which the monitor degrades to Critical
+  NumSamples - the number of CONSECUTIVE samples in the same non healthy category required before the monitor changes state (1 to 255)
+
+  CONFIGURATION EXAMPLES:
+    LOWER IS WORSE - free space percent on the system drive (this is what the shipped script measures)
+      Direction = LowerIsWorse, WarningThreshold = 15, CriticalThreshold = 10
+      Critical when Value is at or below 10.  Warning when Value is above 10 and at or below 15.  Healthy when Value is above 15.
+      CriticalThreshold must be at or BELOW WarningThreshold in this direction.
+    HIGHER IS WORSE - a queue depth, an error count, a latency in milliseconds
+      Direction = HigherIsWorse, WarningThreshold = 100, CriticalThreshold = 500
+      Critical when Value is at or above 500.  Warning when Value is at or above 100 and below 500.  Healthy when Value is below 100.
+      CriticalThreshold must be at or ABOVE WarningThreshold in this direction.
+
+  EXACT EQUALITY BOUNDARIES:
+    HigherIsWorse:  Value at or above CriticalThreshold = Critical.  Otherwise Value at or above WarningThreshold = Warning.  Otherwise = Healthy.
+    LowerIsWorse:   Value at or below CriticalThreshold = Critical.  Otherwise Value at or below WarningThreshold = Warning.  Otherwise = Healthy.
+    A value exactly equal to a threshold therefore lands in the WORSE state.  With HigherIsWorse 100/500: 99.999 is Healthy, 100 is Warning, 499.999 is Warning, 500 is Critical.
+    The three ranges are evaluated as an IF / ELSEIF / ELSE chain over a single parsed double, so they are exhaustive and mutually exclusive - no finite numeric value is left unhandled and no two states can both match.
+    Setting WarningThreshold equal to CriticalThreshold is allowed and simply collapses the monitor into a two state monitor: the Warning branch becomes unreachable.
+
+  THRESHOLD ORDER VALIDATION:
+    The script validates the pair against Direction on every run.  A pair that is ordered the wrong way round, or a Direction that is neither HigherIsWorse nor LowerIsWorse,
+    produces Result Critical with FailureType ThresholdConfigurationError and an event in the Operations Manager log.  It NEVER silently picks a state and it never reports Healthy.
+
+  CONSECUTIVE SAMPLE BEHAVIOUR:
+    NumSamples is applied with SuppressionSettings/MatchCount on the Warning and Critical filters.  It is NOT applied to the Healthy filter.
+    Escalation Healthy to Warning        : NumSamples consecutive Warning samples.
+    Escalation Healthy to Critical       : NumSamples consecutive Critical samples.  A direct Healthy to Critical jump is fully supported - the Warning counter is irrelevant because the Warning expression simply did not match.
+    Escalation Warning to Critical       : NumSamples consecutive Critical samples.
+    De-escalation Critical to Warning    : NumSamples consecutive Warning samples.
+    Recovery to Healthy (from any state) : ONE Healthy sample.  Recovery is immediate and deliberately not sample counted.
+    Collection problems                  : counted as CRITICAL samples (see HOW COLLECTION PROBLEMS ARE TREATED below), so NumSamples consecutive bad collections are needed before the monitor degrades, and one transient script error does not flap it.
+    ALTERNATING SAMPLES: each filter counts its OWN consecutive matches and a non matching sample resets that filter's counter.
+      A sequence of Warning, Critical, Warning, Critical ... therefore never accumulates NumSamples in either filter, and the monitor STAYS IN ITS CURRENT STATE indefinitely.
+      That is the intended noise suppression behaviour, but it does mean a genuinely oscillating measurement is reported as whatever the monitor was before the oscillation started.
+      If you need an oscillating measurement to escalate, set NumSamples to 1, or average the value inside the MEASUREMENT BLOCK before returning it.
+
+  THIS IS NOT HYSTERESIS:
+    Consecutive sample counting delays a state change - it does not create a separate recovery threshold.  A single sample back inside the healthy range returns the monitor to Healthy immediately,
+    even if the measurement is sitting right on the boundary and will breach again on the next sample.
+    If you want true hysteresis you must add distinct recovery thresholds (for example WarningRecoveryThreshold and CriticalRecoveryThreshold), compare against them in the script when the previous
+    result was non healthy, and return the recovery decision in the propertybag.  This fragment deliberately does NOT do that, so do not describe its NumSamples behaviour as hysteresis.
+
+  HOW COLLECTION PROBLEMS ARE TREATED:
+    Every one of these is reported as Result Critical - NEVER as Success and never as "no data" - and each carries its own FailureType so you can tell them apart in the alert and in the agent event log:
+      MissingData                  the measurement block returned nothing at all
+      NonNumericData               the measurement block returned something that is not a finite number (text, NaN, Infinity)
+      ThresholdConfigurationError  Direction is invalid, or the threshold pair is ordered the wrong way round
+      ScriptFailure                the measurement block threw an exception
+    A healthy run reports FailureType None, so "Result = Critical and FailureType is not None" is exactly the "we could not measure this" case, and the alert description prints both.
+    WHY NOT A SEPARATE FAILURE STATE: SCOM refuses to verify a unit monitor that maps two operational states to the same HealthState, so a distinct "Data Collection Failure" state mapped to Error is not possible here.
+      Folding collection problems into Critical keeps the monitor at three states and keeps a collection problem loudly unhealthy, which is the behaviour that matters.
+    LIMITATION WORTH KNOWING: if the PowerShell module itself cannot run at all - a module timeout, a host crash, a missing script host - then NO data item is produced and SCOM leaves the monitor
+      in its previous state.  That is a SCOM behaviour, not something this fragment can catch.  Watch the agent Health Service and the Operations Manager event log for those cases.
+
+Version: 1.0
+LastModified: 11-Sep-2026
+%%
+
+In this fragment you need to replace:
+  ##CompanyID##
+  ##AppName##
+  ##ClassID##
+  ##UniqueID##
+  ##IntervalSeconds##
+  ##Direction##
+  ##WarningThreshold##
+  ##CriticalThreshold##
+  ##NumSamples##
+
+This fragment depends on references:
+  RequiredReference: Alias="System", ID="System.Library"
+  RequiredReference: Alias="Windows", ID="Microsoft.Windows.Library"
+  RequiredReference: Alias="Health", ID="System.Health.Library"
+
+@@Author=FragmentLibrary Contributor@@
+-->
+  <TypeDefinitions>
+    <ModuleTypes>
+      <DataSourceModuleType ID="##CompanyID##.##AppName##.##UniqueID##.ThreeState.Monitor.DS" Accessibility="Internal" Batching="false">
+        <Configuration>
+          <xsd:element minOccurs="1" name="IntervalSeconds" type="xsd:integer" xmlns:xsd="http://www.w3.org/2001/XMLSchema" />
+          <xsd:element minOccurs="0" name="SyncTime" type="xsd:string" xmlns:xsd="http://www.w3.org/2001/XMLSchema" />
+          <xsd:element minOccurs="1" name="Direction" type="xsd:string" xmlns:xsd="http://www.w3.org/2001/XMLSchema" />
+          <xsd:element minOccurs="1" name="WarningThreshold" type="xsd:double" xmlns:xsd="http://www.w3.org/2001/XMLSchema" />
+          <xsd:element minOccurs="1" name="CriticalThreshold" type="xsd:double" xmlns:xsd="http://www.w3.org/2001/XMLSchema" />
+          <xsd:element minOccurs="1" name="TimeoutSeconds" type="xsd:integer" xmlns:xsd="http://www.w3.org/2001/XMLSchema" />
+        </Configuration>
+        <OverrideableParameters>
+          <OverrideableParameter ID="IntervalSeconds" Selector="$Config/IntervalSeconds$" ParameterType="int" />
+          <OverrideableParameter ID="SyncTime" Selector="$Config/SyncTime$" ParameterType="string" />
+          <OverrideableParameter ID="Direction" Selector="$Config/Direction$" ParameterType="string" />
+          <OverrideableParameter ID="WarningThreshold" Selector="$Config/WarningThreshold$" ParameterType="double" />
+          <OverrideableParameter ID="CriticalThreshold" Selector="$Config/CriticalThreshold$" ParameterType="double" />
+          <OverrideableParameter ID="TimeoutSeconds" Selector="$Config/TimeoutSeconds$" ParameterType="int" />
+        </OverrideableParameters>
+        <ModuleImplementation Isolation="Any">
+          <Composite>
+            <MemberModules>
+              <DataSource ID="Scheduler" TypeID="System!System.Scheduler">
+                <Scheduler>
+                  <SimpleReccuringSchedule>
+                    <Interval Unit="Seconds">$Config/IntervalSeconds$</Interval>
+                    <SyncTime>$Config/SyncTime$</SyncTime>
+                  </SimpleReccuringSchedule>
+                  <ExcludeDates />
+                </Scheduler>
+              </DataSource>
+              <ProbeAction ID="PA" TypeID="Windows!Microsoft.Windows.PowerShellPropertyBagTriggerOnlyProbe">
+                <ScriptName>##CompanyID##.##AppName##.##UniqueID##.ThreeState.Monitor.DS.ps1</ScriptName>
+                <ScriptBody>
+#=================================================================================
+#  Generic numeric three state monitor data source
+#  Measures one number, classifies it against a warning and a critical threshold
+#  in either direction, and always emits exactly one of:
+#    Result = Success | Warning | Critical
+#  Any collection problem is reported as Critical with a FailureType, never
+#  as Success and never as silence
+#  Replace only the MEASUREMENT BLOCK further down
+#
+#  Author:
+#  v1.0
+#=================================================================================
+param([string]$Direction,[double]$WarningThreshold,[double]$CriticalThreshold)
+
+
+# Manual Testing section - put stuff here for manually testing script - typically parameters:
+#=================================================================================
+# [string]$Direction = "LowerIsWorse"
+# [double]$WarningThreshold = 15
+# [double]$CriticalThreshold = 10
+#=================================================================================
+
+
+# Constants section - modify stuff here:
+#=================================================================================
+# Assign script name variable for use in event logging.
+$ScriptName = "##CompanyID##.##AppName##.##UniqueID##.ThreeState.Monitor.DS.ps1"
+$EventID = "4830"
+# A short name for what is being measured.  It shows up in the alert and in the logged events.
+$MeasurementName = "System drive free space percent"
+#=================================================================================
+
+
+# Starting Script section - All scripts get this
+#=================================================================================
+# Gather the start time of the script
+$StartTime = Get-Date
+#Set variable to be used in logging events
+$whoami = whoami
+# Load MOMScript API
+$momapi = New-Object -comObject MOM.ScriptAPI
+# Load PropertyBag function
+$bag = $momapi.CreatePropertyBag()
+#=================================================================================
+
+
+# Begin MAIN script section
+#=================================================================================
+[string]$Result = "Critical"
+[string]$FailureType = "None"
+[string]$Message = ""
+[string]$ReportedValue = ""
+$RawValue = $null
+
+# ---- Threshold and direction validation.  This runs BEFORE anything is measured. ----
+[string]$Dir = ([string]$Direction).Trim().ToUpper()
+[bool]$ConfigOk = $true
+
+IF ($Dir -ne "HIGHERISWORSE" -AND $Dir -ne "LOWERISWORSE")
+{
+  $ConfigOk = $false
+  $FailureType = "ThresholdConfigurationError"
+  $Message = "Direction ($Direction) is not valid. Use HigherIsWorse or LowerIsWorse."
+}
+ELSEIF ($Dir -eq "HIGHERISWORSE" -AND $CriticalThreshold -lt $WarningThreshold)
+{
+  $ConfigOk = $false
+  $FailureType = "ThresholdConfigurationError"
+  $Message = "With Direction HigherIsWorse the CriticalThreshold ($CriticalThreshold) must be at or above the WarningThreshold ($WarningThreshold)."
+}
+ELSEIF ($Dir -eq "LOWERISWORSE" -AND $CriticalThreshold -gt $WarningThreshold)
+{
+  $ConfigOk = $false
+  $FailureType = "ThresholdConfigurationError"
+  $Message = "With Direction LowerIsWorse the CriticalThreshold ($CriticalThreshold) must be at or below the WarningThreshold ($WarningThreshold)."
+}
+
+IF ($ConfigOk -eq $true)
+{
+  # =========================== MEASUREMENT BLOCK ===========================
+  # REPLACE EVERYTHING BETWEEN THESE TWO MARKERS.
+  # Requirements for your replacement:
+  #   - assign ONE numeric value to $RawValue
+  #   - leave $RawValue as $null if you genuinely could not measure anything
+  #   - let exceptions propagate, or throw your own - the CATCH below turns them into FailureType ScriptFailure
+  # The shipped example measures free space percent on the system drive, which is a LowerIsWorse measurement.
+  TRY
+  {
+    [string]$SystemDrive = $env:SystemDrive
+    $Disk = Get-WmiObject -Class Win32_LogicalDisk -Filter "DeviceID='$SystemDrive'" -ErrorAction Stop
+    IF ($Disk -eq $null)
+    {
+      $RawValue = $null
+    }
+    ELSEIF ([double]$Disk.Size -eq 0)
+    {
+      THROW "Win32_LogicalDisk reported a total size of 0 for ($SystemDrive), so a percentage cannot be calculated."
+    }
+    ELSE
+    {
+      $RawValue = [math]::Round((([double]$Disk.FreeSpace / [double]$Disk.Size) * 100),2)
+    }
+  }
+  CATCH
+  {
+    $ConfigOk = $false
+    $FailureType = "ScriptFailure"
+    $Message = "The measurement block threw an exception while measuring ($MeasurementName). Error: $($_.Exception.Message)"
+  }
+  # ========================= END MEASUREMENT BLOCK =========================
+}
+
+IF ($ConfigOk -eq $true)
+{
+  IF ($RawValue -eq $null -OR [string]::IsNullOrEmpty([string]$RawValue))
+  {
+    $ConfigOk = $false
+    $FailureType = "MissingData"
+    $Message = "The measurement block returned no value for ($MeasurementName)."
+  }
+}
+
+[double]$Value = 0
+IF ($ConfigOk -eq $true)
+{
+  # Parse with the invariant culture so an agent running under a comma decimal locale still behaves
+  IF (-NOT [double]::TryParse([string]$RawValue,[System.Globalization.NumberStyles]::Float,[System.Globalization.CultureInfo]::InvariantCulture,[ref]$Value))
+  {
+    $ConfigOk = $false
+    $FailureType = "NonNumericData"
+    $Message = "The measurement block returned ($RawValue) for ($MeasurementName), which is not a number."
+  }
+  ELSEIF ([double]::IsNaN($Value) -OR [double]::IsInfinity($Value))
+  {
+    $ConfigOk = $false
+    $FailureType = "NonNumericData"
+    $Message = "The measurement block returned ($RawValue) for ($MeasurementName), which is not a finite number."
+  }
+}
+
+IF ($ConfigOk -eq $true)
+{
+  $ReportedValue = [string]$Value
+  $FailureType = "None"
+
+  # Exact boundaries - a value exactly equal to a threshold lands in the WORSE state
+  IF ($Dir -eq "HIGHERISWORSE")
+  {
+    IF ($Value -ge $CriticalThreshold)
+    {
+      $Result = "Critical"
+      $Message = "$MeasurementName is ($Value), at or above the critical threshold of ($CriticalThreshold)."
+    }
+    ELSEIF ($Value -ge $WarningThreshold)
+    {
+      $Result = "Warning"
+      $Message = "$MeasurementName is ($Value), at or above the warning threshold of ($WarningThreshold)."
+    }
+    ELSE
+    {
+      $Result = "Success"
+      $Message = "$MeasurementName is ($Value), below the warning threshold of ($WarningThreshold)."
+    }
+  }
+  ELSE
+  {
+    IF ($Value -le $CriticalThreshold)
+    {
+      $Result = "Critical"
+      $Message = "$MeasurementName is ($Value), at or below the critical threshold of ($CriticalThreshold)."
+    }
+    ELSEIF ($Value -le $WarningThreshold)
+    {
+      $Result = "Warning"
+      $Message = "$MeasurementName is ($Value), at or below the warning threshold of ($WarningThreshold)."
+    }
+    ELSE
+    {
+      $Result = "Success"
+      $Message = "$MeasurementName is ($Value), above the warning threshold of ($WarningThreshold)."
+    }
+  }
+}
+ELSE
+{
+  # Every failure path lands here.  A collection problem is NEVER reported as Success - it is reported as Critical with a FailureType that says what went wrong.
+  $Result = "Critical"
+}
+
+IF ($Result -eq "Success")
+{
+  $momapi.LogScriptEvent($ScriptName,$EventID,0,"`n $Message `n Direction: ($Direction). `n WarningThreshold: ($WarningThreshold). `n CriticalThreshold: ($CriticalThreshold). `n Running as ($whoami).")
+}
+ELSE
+{
+  $momapi.LogScriptEvent($ScriptName,$EventID,1,"`n $Result ($FailureType): $Message `n Direction: ($Direction). `n WarningThreshold: ($WarningThreshold). `n CriticalThreshold: ($CriticalThreshold). `n Running as ($whoami).")
+}
+
+$bag.AddValue('Result',$Result)
+$bag.AddValue('FailureType',$FailureType)
+$bag.AddValue('Message',$Message)
+$bag.AddValue('MeasurementName',$MeasurementName)
+$bag.AddValue('Value',$ReportedValue)
+$bag.AddValue('Direction',$Direction)
+$bag.AddValue('WarningThreshold',$WarningThreshold)
+$bag.AddValue('CriticalThreshold',$CriticalThreshold)
+
+# Return all bags
+$bag
+#=================================================================================
+# End MAIN script section
+
+
+# End of script section
+#=================================================================================
+#Log an event for script ending and total execution time.
+$EndTime = Get-Date
+$ScriptTime = ($EndTime - $StartTime).TotalSeconds
+$momapi.LogScriptEvent($ScriptName,$EventID,0,"`n Script Completed. `n Script Runtime: ($ScriptTime) seconds.")
+#=================================================================================
+# End of script
+                </ScriptBody>
+                <Parameters>
+                  <Parameter>
+                    <Name>Direction</Name>
+                    <Value>$Config/Direction$</Value>
+                  </Parameter>
+                  <Parameter>
+                    <Name>WarningThreshold</Name>
+                    <Value>$Config/WarningThreshold$</Value>
+                  </Parameter>
+                  <Parameter>
+                    <Name>CriticalThreshold</Name>
+                    <Value>$Config/CriticalThreshold$</Value>
+                  </Parameter>
+                </Parameters>
+                <TimeoutSeconds>$Config/TimeoutSeconds$</TimeoutSeconds>
+              </ProbeAction>
+            </MemberModules>
+            <Composition>
+              <Node ID="PA">
+                <Node ID="Scheduler" />
+              </Node>
+            </Composition>
+          </Composite>
+        </ModuleImplementation>
+        <OutputType>System!System.PropertyBagData</OutputType>
+      </DataSourceModuleType>
+    </ModuleTypes>
+    <MonitorTypes>
+      <UnitMonitorType ID="##CompanyID##.##AppName##.##UniqueID##.ThreeState.MonitorType" Accessibility="Internal">
+        <MonitorTypeStates>
+          <MonitorTypeState ID="Success" NoDetection="false" />
+          <MonitorTypeState ID="Warning" NoDetection="false" />
+          <MonitorTypeState ID="Critical" NoDetection="false" />
+          <!-- Three states only.  SCOM will not verify a unit monitor that maps two operational states to the same HealthState, so collection failures are folded into Critical and identified by the FailureType propertybag value -->
+        </MonitorTypeStates>
+        <Configuration>
+          <xsd:element minOccurs="1" name="IntervalSeconds" type="xsd:integer" xmlns:xsd="http://www.w3.org/2001/XMLSchema" />
+          <xsd:element minOccurs="0" name="SyncTime" type="xsd:string" xmlns:xsd="http://www.w3.org/2001/XMLSchema" />
+          <xsd:element minOccurs="1" name="Direction" type="xsd:string" xmlns:xsd="http://www.w3.org/2001/XMLSchema" />
+          <xsd:element minOccurs="1" name="WarningThreshold" type="xsd:double" xmlns:xsd="http://www.w3.org/2001/XMLSchema" />
+          <xsd:element minOccurs="1" name="CriticalThreshold" type="xsd:double" xmlns:xsd="http://www.w3.org/2001/XMLSchema" />
+          <xsd:element minOccurs="1" name="TimeoutSeconds" type="xsd:integer" xmlns:xsd="http://www.w3.org/2001/XMLSchema" />
+          <xsd:element minOccurs="1" name="NumSamples" type="xsd:integer" xmlns:xsd="http://www.w3.org/2001/XMLSchema" />
+        </Configuration>
+        <OverrideableParameters>
+          <OverrideableParameter ID="IntervalSeconds" Selector="$Config/IntervalSeconds$" ParameterType="int" />
+          <OverrideableParameter ID="SyncTime" Selector="$Config/SyncTime$" ParameterType="string" />
+          <OverrideableParameter ID="Direction" Selector="$Config/Direction$" ParameterType="string" />
+          <OverrideableParameter ID="WarningThreshold" Selector="$Config/WarningThreshold$" ParameterType="double" />
+          <OverrideableParameter ID="CriticalThreshold" Selector="$Config/CriticalThreshold$" ParameterType="double" />
+          <OverrideableParameter ID="TimeoutSeconds" Selector="$Config/TimeoutSeconds$" ParameterType="int" />
+          <OverrideableParameter ID="NumSamples" Selector="$Config/NumSamples$" ParameterType="int" />
+        </OverrideableParameters>
+        <MonitorImplementation>
+          <MemberModules>
+            <DataSource ID="DS" TypeID="##CompanyID##.##AppName##.##UniqueID##.ThreeState.Monitor.DS">
+              <IntervalSeconds>$Config/IntervalSeconds$</IntervalSeconds>
+              <SyncTime>$Config/SyncTime$</SyncTime>
+              <Direction>$Config/Direction$</Direction>
+              <WarningThreshold>$Config/WarningThreshold$</WarningThreshold>
+              <CriticalThreshold>$Config/CriticalThreshold$</CriticalThreshold>
+              <TimeoutSeconds>$Config/TimeoutSeconds$</TimeoutSeconds>
+            </DataSource>
+            <ConditionDetection ID="SuccessFilter" TypeID="System!System.ExpressionFilter">
+              <Expression>
+                <SimpleExpression>
+                  <ValueExpression>
+                    <XPathQuery Type="String">Property[@Name='Result']</XPathQuery>
+                  </ValueExpression>
+                  <Operator>Equal</Operator>
+                  <ValueExpression>
+                    <Value Type="String">Success</Value>
+                  </ValueExpression>
+                </SimpleExpression>
+              </Expression>
+              <!-- Deliberately NO SuppressionSettings.  One healthy sample recovers the monitor immediately.  This is sample counting, not hysteresis. -->
+            </ConditionDetection>
+            <ConditionDetection ID="WarningFilter" TypeID="System!System.ExpressionFilter">
+              <Expression>
+                <SimpleExpression>
+                  <ValueExpression>
+                    <XPathQuery Type="String">Property[@Name='Result']</XPathQuery>
+                  </ValueExpression>
+                  <Operator>Equal</Operator>
+                  <ValueExpression>
+                    <Value Type="String">Warning</Value>
+                  </ValueExpression>
+                </SimpleExpression>
+              </Expression>
+              <SuppressionSettings>
+                <MatchCount>$Config/NumSamples$</MatchCount>
+              </SuppressionSettings>
+            </ConditionDetection>
+            <ConditionDetection ID="CriticalFilter" TypeID="System!System.ExpressionFilter">
+              <Expression>
+                <SimpleExpression>
+                  <ValueExpression>
+                    <XPathQuery Type="String">Property[@Name='Result']</XPathQuery>
+                  </ValueExpression>
+                  <Operator>Equal</Operator>
+                  <ValueExpression>
+                    <Value Type="String">Critical</Value>
+                  </ValueExpression>
+                </SimpleExpression>
+              </Expression>
+              <SuppressionSettings>
+                <MatchCount>$Config/NumSamples$</MatchCount>
+              </SuppressionSettings>
+            </ConditionDetection>
+            <!-- The script always emits Result as exactly Success, Warning or Critical - including for every collection failure - so the three filters are exhaustive and mutually exclusive -->
+          </MemberModules>
+          <RegularDetections>
+            <RegularDetection MonitorTypeStateID="Success">
+              <Node ID="SuccessFilter">
+                <Node ID="DS" />
+              </Node>
+            </RegularDetection>
+            <RegularDetection MonitorTypeStateID="Warning">
+              <Node ID="WarningFilter">
+                <Node ID="DS" />
+              </Node>
+            </RegularDetection>
+            <RegularDetection MonitorTypeStateID="Critical">
+              <Node ID="CriticalFilter">
+                <Node ID="DS" />
+              </Node>
+            </RegularDetection>
+          </RegularDetections>
+          <OnDemandDetections>
+            <OnDemandDetection MonitorTypeStateID="Success">
+              <Node ID="SuccessFilter">
+                <Node ID="DS" />
+              </Node>
+            </OnDemandDetection>
+            <OnDemandDetection MonitorTypeStateID="Warning">
+              <Node ID="WarningFilter">
+                <Node ID="DS" />
+              </Node>
+            </OnDemandDetection>
+            <OnDemandDetection MonitorTypeStateID="Critical">
+              <Node ID="CriticalFilter">
+                <Node ID="DS" />
+              </Node>
+            </OnDemandDetection>
+          </OnDemandDetections>
+        </MonitorImplementation>
+      </UnitMonitorType>
+    </MonitorTypes>
+  </TypeDefinitions>
+  <Monitoring>
+    <Monitors>
+      <UnitMonitor ID="##CompanyID##.##AppName##.##UniqueID##.ThreeState.Monitor" Accessibility="Public" Enabled="true" Target="##ClassID##" ParentMonitorID="Health!System.Health.PerformanceState" Remotable="true" Priority="Normal" TypeID="##CompanyID##.##AppName##.##UniqueID##.ThreeState.MonitorType" ConfirmDelivery="true">
+        <Category>PerformanceHealth</Category>
+        <AlertSettings AlertMessage="##CompanyID##.##AppName##.##UniqueID##.ThreeState.Monitor.AlertMessage">
+          <AlertOnState>Warning</AlertOnState>  <!-- Warning means the alert is raised when the monitor enters Warning or the worse Error state -->
+          <AutoResolve>true</AutoResolve>  <!-- The alert closes automatically when the monitor returns to Healthy -->
+          <AlertPriority>Normal</AlertPriority>
+          <AlertSeverity>MatchMonitorHealth</AlertSeverity>  <!-- The alert severity follows the monitor health: the Warning state raises a Warning alert and the Critical state raises a Critical alert -->
+          <AlertParameters>
+            <AlertParameter1>$Data/Context/Property[@Name='MeasurementName']$</AlertParameter1>
+            <AlertParameter2>$Data/Context/Property[@Name='Value']$</AlertParameter2>
+            <AlertParameter3>$Data/Context/Property[@Name='WarningThreshold']$</AlertParameter3>
+            <AlertParameter4>$Data/Context/Property[@Name='CriticalThreshold']$</AlertParameter4>
+            <AlertParameter5>$Data/Context/Property[@Name='Direction']$</AlertParameter5>
+            <AlertParameter6>$Data/Context/Property[@Name='Result']$</AlertParameter6>
+            <AlertParameter7>$Data/Context/Property[@Name='FailureType']$</AlertParameter7>
+            <AlertParameter8>$Data/Context/Property[@Name='Message']$</AlertParameter8>
+          </AlertParameters>
+        </AlertSettings>
+        <OperationalStates>
+          <OperationalState ID="Success" MonitorTypeStateID="Success" HealthState="Success" />
+          <OperationalState ID="Warning" MonitorTypeStateID="Warning" HealthState="Warning" />
+          <OperationalState ID="Critical" MonitorTypeStateID="Critical" HealthState="Error" />
+          <!-- SCOM does not allow two operational states to share a HealthState, so a collection failure uses this same Critical state and is identified by the FailureType value in the alert -->
+        </OperationalStates>
+        <Configuration>
+          <IntervalSeconds>##IntervalSeconds##</IntervalSeconds>
+          <SyncTime></SyncTime>
+          <Direction>##Direction##</Direction>  <!-- HigherIsWorse or LowerIsWorse -->
+          <WarningThreshold>##WarningThreshold##</WarningThreshold>
+          <CriticalThreshold>##CriticalThreshold##</CriticalThreshold>  <!-- Must be at or above WarningThreshold for HigherIsWorse, at or below it for LowerIsWorse -->
+          <TimeoutSeconds>120</TimeoutSeconds>  <!-- Must be smaller than IntervalSeconds -->
+          <NumSamples>##NumSamples##</NumSamples>  <!-- 1 to 255 consecutive samples in the same non healthy category before the monitor changes state.  One healthy sample always recovers it -->
+        </Configuration>
+      </UnitMonitor>
+    </Monitors>
+  </Monitoring>
+  <Presentation>
+    <StringResources>
+      <StringResource ID="##CompanyID##.##AppName##.##UniqueID##.ThreeState.Monitor.AlertMessage" />
+    </StringResources>
+  </Presentation>
+  <LanguagePacks>
+    <LanguagePack ID="ENU" IsDefault="true">
+      <DisplayStrings>
+        <DisplayString ElementID="##CompanyID##.##AppName##.##UniqueID##.ThreeState.Monitor">
+          <Name>##CompanyID## ##AppName## ##UniqueID## Three State Threshold Monitor</Name>
+          <Description />
+        </DisplayString>
+        <DisplayString ElementID="##CompanyID##.##AppName##.##UniqueID##.ThreeState.Monitor" SubElementID="Success">
+          <Name>Within Thresholds</Name>
+        </DisplayString>
+        <DisplayString ElementID="##CompanyID##.##AppName##.##UniqueID##.ThreeState.Monitor" SubElementID="Warning">
+          <Name>Warning Threshold Breached</Name>
+        </DisplayString>
+        <DisplayString ElementID="##CompanyID##.##AppName##.##UniqueID##.ThreeState.Monitor" SubElementID="Critical">
+          <Name>Critical Threshold Breached Or Measurement Failed</Name>
+        </DisplayString>
+        <DisplayString ElementID="##CompanyID##.##AppName##.##UniqueID##.ThreeState.Monitor.AlertMessage">
+          <Name>##CompanyID## ##AppName## ##UniqueID## threshold breached or measurement failed</Name>
+          <Description>A monitored numeric value breached a threshold, or the value could not be measured.
+
+Measurement: {0}
+Measured value: {1}
+Warning threshold: {2}
+Critical threshold: {3}
+Direction: {4}
+Result: {5}
+Failure type: {6}
+
+{7}</Description>
+        </DisplayString>
+      </DisplayStrings>
+    </LanguagePack>
+  </LanguagePacks>
+</ManagementPackFragment>

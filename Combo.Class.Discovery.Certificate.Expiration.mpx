@@ -1,0 +1,900 @@
+﻿<ManagementPackFragment SchemaVersion="2.0" xmlns:xsd="http://www.w3.org/2001/XMLSchema">
+<!--
+%%
+Description:
+  A CLASS and DISCOVERY and three state MONITOR which discovers selected certificates in a local machine certificate store and monitors how many days of validity each one has left
+  One class instance is created per matching certificate, keyed on the certificate THUMBPRINT, and one monitor instance watches each certificate
+  CompanyID - is a short abbreviation for your company with NO SPACES OR SPECIAL CHARACTERS ALLOWED
+  AppName - is a short name for your app with NO SPACES OR SPECIAL CHARACTERS ALLOWED
+  UniqueID - We need a Unique ID to reuse the fragment within the same MP.  Use a shortened descriptive name with NO SPACES OR SPECIAL CHARACTERS ALLOWED such as "WebServerCerts"
+  StoreLocation - LocalMachine or CurrentUser.  LocalMachine is almost always what you want for a server agent
+  StoreName - the certificate store to read.  My (Personal), WebHosting, Root, CA, TrustedPublisher, and so on
+  SubjectMatch - a PowerShell wildcard match against the certificate Subject.  Use * for every certificate.  Example: *CN=*.contoso.com*
+  IssuerMatch - a PowerShell wildcard match against the certificate Issuer.  Use * for every issuer.  Example: *Contoso Issuing CA*
+  EnhancedKeyUsageMatch - a PowerShell wildcard match against the certificate Enhanced Key Usage friendly names AND OIDs.  Use * for every certificate.  Example: *Server Authentication* or 1.3.6.1.5.5.7.3.1
+  WarningDaysRemaining - days of remaining validity at or below which the monitor goes to Warning
+  CriticalDaysRemaining - days of remaining validity at or below which the monitor goes to Critical
+  IntervalSeconds - how often each discovered certificate is re-inspected
+
+  SELECTION CRITERIA:
+    A certificate is discovered when Subject matches SubjectMatch AND Issuer matches IssuerMatch AND (EnhancedKeyUsageMatch is * OR one of its EKU friendly names or OIDs matches EnhancedKeyUsageMatch).
+    All three matches are PowerShell -like wildcard matches and are therefore CASE INSENSITIVE.  Use * to disable a criterion.
+    A certificate that carries NO Enhanced Key Usage extension is treated as "valid for any purpose" and is only discovered when EnhancedKeyUsageMatch is *.
+    IncludeExpired controls whether already expired certificates are discovered at all.  It defaults to true so that an expired certificate is loudly Critical rather than silently undiscovered.
+
+  INSTANCE IDENTITY:
+    The KEY property is Thumbprint, and the class is hosted by Microsoft.Windows.Computer, so the identity is (computer + store location + store name are descriptive, thumbprint is the key).
+    A thumbprint is the SHA1 hash of the whole certificate, so it is stable for the life of a certificate and is guaranteed to change when the certificate is replaced.
+    Subject is deliberately NOT the key: two certificates with the same subject legitimately coexist during a renewal overlap, and a subject based key would collide.
+
+  DISCOVERY TIMING AND CERTIFICATE RENEWAL:
+    Discovery runs every 14400 seconds (4 hours) by default and submits a SNAPSHOT of the matching certificates on that computer.
+    When a certificate is renewed the new certificate has a NEW thumbprint, so it appears as a NEW instance at the next discovery cycle and starts out Healthy.
+    The old certificate keeps its own instance and its own monitor until it is removed from the store.  It will correctly go Warning and then Critical while it is still present.
+    When the old certificate is deleted from the store, the next discovery snapshot no longer contains it, SCOM deletes the instance, and SCOM closes the monitor generated alerts for the deleted object.
+    That means the worst case window between "old certificate removed from the store" and "its alert disappears" is one discovery interval.  Lower IntervalSeconds on the discovery if you want that window shorter.
+    Because a renewal creates a brand new instance, do NOT put certificate overrides on individual instances - they will not follow the renewed certificate.  Override on a group or on the class instead.
+
+  COLLECTION FAILURE HANDLING - THIS IS THE IMPORTANT PART:
+    A snapshot discovery that returns zero instances DELETES every previously discovered instance.  That is correct when the store genuinely contains no matching certificates and it is catastrophic when the store could not be read.
+    The discovery script therefore separates the two cases:
+      Store opened, zero matches     ->  submits an EMPTY snapshot on purpose.  Instances are removed because they really are gone.
+      Store could not be opened/read ->  logs an ERROR event and EXITS WITHOUT SUBMITTING ANY DISCOVERY DATA.  Existing instances survive untouched until the next successful run.
+    The monitoring script applies the same rule: a store read failure, or a certificate that is no longer in the store, is reported as Critical with an explanatory message.  Neither is ever reported as Healthy.
+
+  THRESHOLD BOUNDARIES (exact):
+    DaysRemaining = FLOOR( (NotAfter in UTC) - (now in UTC) ) expressed in whole days.  It is NEGATIVE for an already expired certificate.
+    Critical   when DaysRemaining <= CriticalDaysRemaining
+    Warning    when DaysRemaining >  CriticalDaysRemaining AND DaysRemaining <= WarningDaysRemaining
+    Healthy    when DaysRemaining >  WarningDaysRemaining
+    With the shipped 30 / 7 values: 31 days = Healthy, 30 days = Warning, 8 days = Warning, 7 days = Critical, 0 days = Critical, expired (negative) = Critical.
+    The three ranges are exhaustive and mutually exclusive, so no value of DaysRemaining is left unhandled and no two states can both be true.
+    CriticalDaysRemaining must be less than or equal to WarningDaysRemaining.  If it is not, the script logs an error and reports Critical with a configuration error message rather than silently picking a state.
+
+  A NOTE ON SCALE:
+    The monitor data source takes the thumbprint as configuration, so each certificate instance runs its own script.  That is fine for a handful of certificates per server.
+    If you need to watch dozens of certificates per server, use Combo.PowerShell.MultiInstance.Cookdown.Monitor.Performance.mpx as the pattern for a single shared script that emits one propertybag per certificate.
+
+Version: 1.0
+LastModified: 11-Sep-2026
+%%
+
+In this fragment you need to replace:
+  ##CompanyID##
+  ##AppName##
+  ##UniqueID##
+  ##StoreLocation##
+  ##StoreName##
+  ##SubjectMatch##
+  ##IssuerMatch##
+  ##EnhancedKeyUsageMatch##
+  ##IntervalSeconds##
+  ##WarningDaysRemaining##
+  ##CriticalDaysRemaining##
+
+This fragment depends on references:
+  RequiredReference: Alias="System", ID="System.Library"
+  RequiredReference: Alias="Windows", ID="Microsoft.Windows.Library"
+  RequiredReference: Alias="Health", ID="System.Health.Library"
+
+@@Author=FragmentLibrary Contributor@@
+-->
+  <TypeDefinitions>
+    <EntityTypes>
+      <ClassTypes>
+        <ClassType ID="##CompanyID##.##AppName##.##UniqueID##.Certificate.Class" Base="Windows!Microsoft.Windows.LocalApplication" Accessibility="Public" Abstract="false" Hosted="true" Singleton="false">
+          <Property ID="Thumbprint" Type="string" Key="true" CaseSensitive="false" MaxLength="40" MinLength="0" Required="true" />
+          <Property ID="StoreLocation" Type="string" MaxLength="32" />
+          <Property ID="StoreName" Type="string" MaxLength="64" />
+          <Property ID="Subject" Type="string" MaxLength="512" />
+          <Property ID="Issuer" Type="string" MaxLength="512" />
+          <Property ID="FriendlyName" Type="string" MaxLength="256" />
+          <Property ID="SerialNumber" Type="string" MaxLength="128" />
+          <Property ID="EnhancedKeyUsage" Type="string" MaxLength="512" />
+          <Property ID="NotBefore" Type="string" MaxLength="32" />
+          <Property ID="NotAfter" Type="string" MaxLength="32" />
+          <!-- NotBefore and NotAfter are stored as strings in round trip UTC format (yyyy-MM-ddTHH:mm:ssZ) so they sort correctly in views and are unambiguous across agent locales -->
+          <!-- We choose Microsoft.Windows.LocalApplication as our generic base class.  It is hosted by Microsoft.Windows.Computer, so each certificate instance belongs to the computer it lives on -->
+        </ClassType>
+      </ClassTypes>
+    </EntityTypes>
+    <ModuleTypes>
+      <DataSourceModuleType ID="##CompanyID##.##AppName##.##UniqueID##.Certificate.Discovery.DS" Accessibility="Internal" Batching="false">
+        <Configuration>
+          <xsd:element minOccurs="1" name="IntervalSeconds" type="xsd:integer" xmlns:xsd="http://www.w3.org/2001/XMLSchema" />
+          <xsd:element minOccurs="0" name="SyncTime" type="xsd:string" xmlns:xsd="http://www.w3.org/2001/XMLSchema" />
+          <xsd:element minOccurs="1" name="StoreLocation" type="xsd:string" xmlns:xsd="http://www.w3.org/2001/XMLSchema" />
+          <xsd:element minOccurs="1" name="StoreName" type="xsd:string" xmlns:xsd="http://www.w3.org/2001/XMLSchema" />
+          <xsd:element minOccurs="1" name="SubjectMatch" type="xsd:string" xmlns:xsd="http://www.w3.org/2001/XMLSchema" />
+          <xsd:element minOccurs="1" name="IssuerMatch" type="xsd:string" xmlns:xsd="http://www.w3.org/2001/XMLSchema" />
+          <xsd:element minOccurs="1" name="EnhancedKeyUsageMatch" type="xsd:string" xmlns:xsd="http://www.w3.org/2001/XMLSchema" />
+          <xsd:element minOccurs="1" name="IncludeExpired" type="xsd:boolean" xmlns:xsd="http://www.w3.org/2001/XMLSchema" />
+          <xsd:element minOccurs="1" name="DebugLogging" type="xsd:boolean" xmlns:xsd="http://www.w3.org/2001/XMLSchema" />
+          <xsd:element minOccurs="1" name="TimeoutSeconds" type="xsd:integer" xmlns:xsd="http://www.w3.org/2001/XMLSchema" />
+        </Configuration>
+        <OverrideableParameters>
+          <OverrideableParameter ID="IntervalSeconds" Selector="$Config/IntervalSeconds$" ParameterType="int" />
+          <OverrideableParameter ID="SyncTime" Selector="$Config/SyncTime$" ParameterType="string" />
+          <OverrideableParameter ID="StoreLocation" Selector="$Config/StoreLocation$" ParameterType="string" />
+          <OverrideableParameter ID="StoreName" Selector="$Config/StoreName$" ParameterType="string" />
+          <OverrideableParameter ID="SubjectMatch" Selector="$Config/SubjectMatch$" ParameterType="string" />
+          <OverrideableParameter ID="IssuerMatch" Selector="$Config/IssuerMatch$" ParameterType="string" />
+          <OverrideableParameter ID="EnhancedKeyUsageMatch" Selector="$Config/EnhancedKeyUsageMatch$" ParameterType="string" />
+          <OverrideableParameter ID="IncludeExpired" Selector="$Config/IncludeExpired$" ParameterType="bool" />
+          <OverrideableParameter ID="DebugLogging" Selector="$Config/DebugLogging$" ParameterType="bool" />
+          <OverrideableParameter ID="TimeoutSeconds" Selector="$Config/TimeoutSeconds$" ParameterType="int" />
+        </OverrideableParameters>
+        <ModuleImplementation Isolation="Any">
+          <Composite>
+            <MemberModules>
+              <DataSource ID="DS" TypeID="Windows!Microsoft.Windows.TimedPowerShell.DiscoveryProvider">
+                <IntervalSeconds>$Config/IntervalSeconds$</IntervalSeconds>
+                <SyncTime>$Config/SyncTime$</SyncTime>
+                <ScriptName>##CompanyID##.##AppName##.##UniqueID##.Certificate.Discovery.DS.ps1</ScriptName>
+                <ScriptBody>
+#=================================================================================
+#  Discovers certificates in a certificate store that match the supplied criteria
+#  A STORE READ FAILURE never submits discovery data, because an empty snapshot
+#  would delete every previously discovered certificate instance
+#
+#  Author:
+#  v1.0
+#=================================================================================
+param($SourceId,$ManagedEntityId,$ComputerName,$MGName,$StoreLocation,$StoreName,$SubjectMatch,$IssuerMatch,$EnhancedKeyUsageMatch,$IncludeExpired,$DebugLogging)
+
+
+# Manual Testing section - put stuff here for manually testing script - typically parameters:
+#=================================================================================
+# $SourceId = '{00000000-0000-0000-0000-000000000000}'
+# $ManagedEntityId = '{00000000-0000-0000-0000-000000000000}'
+# $ComputerName = "computername.domain.com"
+# $MGName = "MGNAME"
+# $StoreLocation = "LocalMachine"
+# $StoreName = "My"
+# $SubjectMatch = "*"
+# $IssuerMatch = "*"
+# $EnhancedKeyUsageMatch = "*"
+# $IncludeExpired = "true"
+# $DebugLogging = "false"
+#=================================================================================
+
+
+# Constants section - modify stuff here:
+#=================================================================================
+# Assign script name variable for use in event logging.
+# ScriptName should be the same as the ID of the module that the script is contained in
+$ScriptName = "##CompanyID##.##AppName##.##UniqueID##.Certificate.Discovery.DS.ps1"
+$EventID = "4820"
+#=================================================================================
+
+
+# Starting Script section - All scripts get this
+#=================================================================================
+# Gather the start time of the script
+$StartTime = Get-Date
+#Set variable to be used in logging events
+$whoami = whoami
+# Load MOMScript API
+$momapi = New-Object -comObject MOM.ScriptAPI
+#Log script event that we are starting task
+$momapi.LogScriptEvent($ScriptName,$EventID,0,"`n Script is starting. `n Running as ($whoami). `n Management Group: ($MGName). `n Store: ($StoreLocation\$StoreName). `n SubjectMatch: ($SubjectMatch). `n IssuerMatch: ($IssuerMatch). `n EnhancedKeyUsageMatch: ($EnhancedKeyUsageMatch).")
+#=================================================================================
+
+
+# Discovery Script section - Discovery scripts get this
+#=================================================================================
+# Load SCOM Discovery module
+$DiscoveryData = $momapi.CreateDiscoveryData(0, $SourceId, $ManagedEntityId)
+#=================================================================================
+
+
+# Begin MAIN script section
+#=================================================================================
+# Open the store read only.  ANY failure here must abort without submitting discovery data.
+$Certificates = $null
+$Store = $null
+TRY
+{
+  $Store = New-Object System.Security.Cryptography.X509Certificates.X509Store($StoreName,$StoreLocation)
+  $Store.Open([System.Security.Cryptography.X509Certificates.OpenFlags]::ReadOnly)
+  $Certificates = @($Store.Certificates)
+}
+CATCH
+{
+  $momapi.LogScriptEvent($ScriptName,$EventID,1,"`n FATAL ERROR: Unable to open or read certificate store ($StoreLocation\$StoreName). `n Error: $($_.Exception.Message) `n NOT submitting discovery data so existing certificate instances are preserved.")
+  IF ($Store -ne $null) { TRY { $Store.Close() } CATCH {} }
+  $EndTime = Get-Date
+  $ScriptTime = ($EndTime - $StartTime).TotalSeconds
+  $momapi.LogScriptEvent($ScriptName,$EventID,1,"`n Script Completed WITHOUT submitting discovery data. `n Script Runtime: ($ScriptTime) seconds.")
+  EXIT
+}
+TRY { $Store.Close() } CATCH {}
+
+# From this point on the store WAS read successfully, so submitting an empty snapshot is a legitimate "no matching certificates" answer.
+$Now = (Get-Date).ToUniversalTime()
+$MatchCount = 0
+$InspectedCount = 0
+
+FOREACH ($Cert in $Certificates)
+{
+  $InspectedCount++
+
+  [string]$Subject = [string]$Cert.Subject
+  [string]$Issuer = [string]$Cert.Issuer
+  [string]$Thumbprint = [string]$Cert.Thumbprint
+
+  # Build a single searchable string of every EKU friendly name and OID on this certificate
+  $EkuList = @()
+  FOREACH ($Ext in $Cert.Extensions)
+  {
+    IF ($Ext -is [System.Security.Cryptography.X509Certificates.X509EnhancedKeyUsageExtension])
+    {
+      FOREACH ($Oid in $Ext.EnhancedKeyUsages)
+      {
+        IF (-NOT [string]::IsNullOrEmpty($Oid.FriendlyName)) { $EkuList += $Oid.FriendlyName }
+        $EkuList += $Oid.Value
+      }
+    }
+  }
+  [string]$EkuString = ($EkuList -join ", ")
+
+  # Selection criteria
+  IF ($Subject -notlike $SubjectMatch) { CONTINUE }
+  IF ($Issuer -notlike $IssuerMatch) { CONTINUE }
+  IF ($EnhancedKeyUsageMatch -ne "*")
+  {
+    $EkuMatched = $false
+    FOREACH ($Eku in $EkuList) { IF ($Eku -like $EnhancedKeyUsageMatch) { $EkuMatched = $true; BREAK } }
+    IF ($EkuMatched -ne $true) { CONTINUE }
+  }
+
+  [datetime]$NotAfterUtc = $Cert.NotAfter.ToUniversalTime()
+  [datetime]$NotBeforeUtc = $Cert.NotBefore.ToUniversalTime()
+  [int]$DaysRemaining = [math]::Floor(($NotAfterUtc - $Now).TotalDays)
+
+  IF ($IncludeExpired.ToUpper() -ne "TRUE" -AND $DaysRemaining -lt 0)
+  {
+    IF ($DebugLogging.ToUpper() -eq "TRUE")
+    {
+      $momapi.LogScriptEvent($ScriptName,$EventID,0,"`n DEBUG: Skipping already expired certificate ($Thumbprint) subject ($Subject) because IncludeExpired is false.")
+    }
+    CONTINUE
+  }
+
+  [string]$FriendlyName = [string]$Cert.FriendlyName
+  [string]$SerialNumber = [string]$Cert.SerialNumber
+
+  $instance = $DiscoveryData.CreateClassInstance("$MPElement[Name='##CompanyID##.##AppName##.##UniqueID##.Certificate.Class']$")
+  $instance.AddProperty("$MPElement[Name='Windows!Microsoft.Windows.Computer']/PrincipalName$", $ComputerName)
+  $instance.AddProperty("$MPElement[Name='##CompanyID##.##AppName##.##UniqueID##.Certificate.Class']/Thumbprint$", $Thumbprint)
+  $instance.AddProperty("$MPElement[Name='##CompanyID##.##AppName##.##UniqueID##.Certificate.Class']/StoreLocation$", $StoreLocation)
+  $instance.AddProperty("$MPElement[Name='##CompanyID##.##AppName##.##UniqueID##.Certificate.Class']/StoreName$", $StoreName)
+  $instance.AddProperty("$MPElement[Name='##CompanyID##.##AppName##.##UniqueID##.Certificate.Class']/Subject$", $Subject)
+  $instance.AddProperty("$MPElement[Name='##CompanyID##.##AppName##.##UniqueID##.Certificate.Class']/Issuer$", $Issuer)
+  $instance.AddProperty("$MPElement[Name='##CompanyID##.##AppName##.##UniqueID##.Certificate.Class']/FriendlyName$", $FriendlyName)
+  $instance.AddProperty("$MPElement[Name='##CompanyID##.##AppName##.##UniqueID##.Certificate.Class']/SerialNumber$", $SerialNumber)
+  $instance.AddProperty("$MPElement[Name='##CompanyID##.##AppName##.##UniqueID##.Certificate.Class']/EnhancedKeyUsage$", $EkuString)
+  $instance.AddProperty("$MPElement[Name='##CompanyID##.##AppName##.##UniqueID##.Certificate.Class']/NotBefore$", $NotBeforeUtc.ToString("yyyy-MM-ddTHH:mm:ssZ"))
+  $instance.AddProperty("$MPElement[Name='##CompanyID##.##AppName##.##UniqueID##.Certificate.Class']/NotAfter$", $NotAfterUtc.ToString("yyyy-MM-ddTHH:mm:ssZ"))
+  # DisplayName combines subject and thumbprint so two certificates with the same subject during a renewal overlap are still distinguishable in the console
+  $instance.AddProperty("$MPElement[Name='System!System.Entity']/DisplayName$", "$Subject [$Thumbprint]")
+  $DiscoveryData.AddInstance($instance)
+  $MatchCount++
+
+  IF ($DebugLogging.ToUpper() -eq "TRUE")
+  {
+    $momapi.LogScriptEvent($ScriptName,$EventID,0,"`n DEBUG: Discovered certificate ($Thumbprint). `n Subject: ($Subject). `n Issuer: ($Issuer). `n EKU: ($EkuString). `n NotAfter: ($($NotAfterUtc.ToString('yyyy-MM-ddTHH:mm:ssZ'))). `n DaysRemaining: ($DaysRemaining).")
+  }
+}
+
+IF ($MatchCount -eq 0)
+{
+  $momapi.LogScriptEvent($ScriptName,$EventID,0,"`n Store ($StoreLocation\$StoreName) was read successfully and contains ($InspectedCount) certificates, NONE of which match the selection criteria. `n Submitting an empty snapshot on purpose - any previously discovered certificates really are gone.")
+}
+ELSE
+{
+  $momapi.LogScriptEvent($ScriptName,$EventID,0,"`n Discovery script is returning ($MatchCount) certificates out of ($InspectedCount) inspected in ($StoreLocation\$StoreName).")
+}
+
+# Return Discovery Items Normally
+$DiscoveryData
+# Return Discovery Bag to the command line for testing (does not work from ISE)
+# $momapi.Return($DiscoveryData)
+#=================================================================================
+# End MAIN script section
+
+
+# End of script section
+#=================================================================================
+#Log an event for script ending and total execution time.
+$EndTime = Get-Date
+$ScriptTime = ($EndTime - $StartTime).TotalSeconds
+$momapi.LogScriptEvent($ScriptName,$EventID,0,"`n Script Completed. `n Script Runtime: ($ScriptTime) seconds.")
+#=================================================================================
+# End of script
+                </ScriptBody>
+                <Parameters>
+                  <Parameter>
+                    <Name>SourceId</Name>
+                    <Value>$MPElement$</Value>
+                  </Parameter>
+                  <Parameter>
+                    <Name>ManagedEntityId</Name>
+                    <Value>$Target/Id$</Value>
+                  </Parameter>
+                  <Parameter>
+                    <Name>ComputerName</Name>
+                    <Value>$Target/Host/Property[Type="Windows!Microsoft.Windows.Computer"]/PrincipalName$</Value>
+                  </Parameter>
+                  <Parameter>
+                    <Name>MGName</Name>
+                    <Value>$Target/ManagementGroup/Name$</Value>
+                  </Parameter>
+                  <Parameter>
+                    <Name>StoreLocation</Name>
+                    <Value>$Config/StoreLocation$</Value>
+                  </Parameter>
+                  <Parameter>
+                    <Name>StoreName</Name>
+                    <Value>$Config/StoreName$</Value>
+                  </Parameter>
+                  <Parameter>
+                    <Name>SubjectMatch</Name>
+                    <Value>$Config/SubjectMatch$</Value>
+                  </Parameter>
+                  <Parameter>
+                    <Name>IssuerMatch</Name>
+                    <Value>$Config/IssuerMatch$</Value>
+                  </Parameter>
+                  <Parameter>
+                    <Name>EnhancedKeyUsageMatch</Name>
+                    <Value>$Config/EnhancedKeyUsageMatch$</Value>
+                  </Parameter>
+                  <Parameter>
+                    <Name>IncludeExpired</Name>
+                    <Value>$Config/IncludeExpired$</Value>
+                  </Parameter>
+                  <Parameter>
+                    <Name>DebugLogging</Name>
+                    <Value>$Config/DebugLogging$</Value>
+                  </Parameter>
+                </Parameters>
+                <TimeoutSeconds>$Config/TimeoutSeconds$</TimeoutSeconds>
+              </DataSource>
+            </MemberModules>
+            <Composition>
+              <Node ID="DS" />
+            </Composition>
+          </Composite>
+        </ModuleImplementation>
+        <OutputType>System!System.Discovery.Data</OutputType>
+      </DataSourceModuleType>
+      <DataSourceModuleType ID="##CompanyID##.##AppName##.##UniqueID##.Certificate.Expiration.Monitor.DS" Accessibility="Internal" Batching="false">
+        <Configuration>
+          <xsd:element minOccurs="1" name="IntervalSeconds" type="xsd:integer" xmlns:xsd="http://www.w3.org/2001/XMLSchema" />
+          <xsd:element minOccurs="0" name="SyncTime" type="xsd:string" xmlns:xsd="http://www.w3.org/2001/XMLSchema" />
+          <xsd:element minOccurs="1" name="StoreLocation" type="xsd:string" xmlns:xsd="http://www.w3.org/2001/XMLSchema" />
+          <xsd:element minOccurs="1" name="StoreName" type="xsd:string" xmlns:xsd="http://www.w3.org/2001/XMLSchema" />
+          <xsd:element minOccurs="1" name="Thumbprint" type="xsd:string" xmlns:xsd="http://www.w3.org/2001/XMLSchema" />
+          <xsd:element minOccurs="1" name="WarningDaysRemaining" type="xsd:integer" xmlns:xsd="http://www.w3.org/2001/XMLSchema" />
+          <xsd:element minOccurs="1" name="CriticalDaysRemaining" type="xsd:integer" xmlns:xsd="http://www.w3.org/2001/XMLSchema" />
+          <xsd:element minOccurs="1" name="TimeoutSeconds" type="xsd:integer" xmlns:xsd="http://www.w3.org/2001/XMLSchema" />
+        </Configuration>
+        <OverrideableParameters>
+          <OverrideableParameter ID="IntervalSeconds" Selector="$Config/IntervalSeconds$" ParameterType="int" />
+          <OverrideableParameter ID="SyncTime" Selector="$Config/SyncTime$" ParameterType="string" />
+          <OverrideableParameter ID="WarningDaysRemaining" Selector="$Config/WarningDaysRemaining$" ParameterType="int" />
+          <OverrideableParameter ID="CriticalDaysRemaining" Selector="$Config/CriticalDaysRemaining$" ParameterType="int" />
+          <OverrideableParameter ID="TimeoutSeconds" Selector="$Config/TimeoutSeconds$" ParameterType="int" />
+          <!-- StoreLocation, StoreName and Thumbprint are supplied from the discovered class properties and are deliberately NOT overrideable -->
+        </OverrideableParameters>
+        <ModuleImplementation Isolation="Any">
+          <Composite>
+            <MemberModules>
+              <DataSource ID="Scheduler" TypeID="System!System.Scheduler">
+                <Scheduler>
+                  <SimpleReccuringSchedule>
+                    <Interval Unit="Seconds">$Config/IntervalSeconds$</Interval>
+                    <SyncTime>$Config/SyncTime$</SyncTime>
+                  </SimpleReccuringSchedule>
+                  <ExcludeDates />
+                </Scheduler>
+              </DataSource>
+              <ProbeAction ID="PA" TypeID="Windows!Microsoft.Windows.PowerShellPropertyBagTriggerOnlyProbe">
+                <ScriptName>##CompanyID##.##AppName##.##UniqueID##.Certificate.Expiration.Monitor.DS.ps1</ScriptName>
+                <ScriptBody>
+#=================================================================================
+#  Inspects one certificate (found by thumbprint) and reports remaining validity
+#  Emits Result as exactly one of Success, Warning or Critical
+#  Store read failures and a missing certificate are reported as Critical, never
+#  as Success, so a collection problem can never look like a healthy certificate
+#
+#  Author:
+#  v1.0
+#=================================================================================
+param([string]$StoreLocation,[string]$StoreName,[string]$Thumbprint,[int]$WarningDaysRemaining,[int]$CriticalDaysRemaining)
+
+
+# Manual Testing section - put stuff here for manually testing script - typically parameters:
+#=================================================================================
+# [string]$StoreLocation = "LocalMachine"
+# [string]$StoreName = "My"
+# [string]$Thumbprint = "0000000000000000000000000000000000000000"
+# [int]$WarningDaysRemaining = 30
+# [int]$CriticalDaysRemaining = 7
+#=================================================================================
+
+
+# Constants section - modify stuff here:
+#=================================================================================
+# Assign script name variable for use in event logging.
+$ScriptName = "##CompanyID##.##AppName##.##UniqueID##.Certificate.Expiration.Monitor.DS.ps1"
+$EventID = "4821"
+#=================================================================================
+
+
+# Starting Script section - All scripts get this
+#=================================================================================
+# Gather the start time of the script
+$StartTime = Get-Date
+#Set variable to be used in logging events
+$whoami = whoami
+# Load MOMScript API
+$momapi = New-Object -comObject MOM.ScriptAPI
+# Load PropertyBag function
+$bag = $momapi.CreatePropertyBag()
+#=================================================================================
+
+
+# Begin MAIN script section
+#=================================================================================
+[string]$Result = "Critical"
+[string]$Message = ""
+[string]$Subject = ""
+[string]$Issuer = ""
+[string]$NotAfter = ""
+[int]$DaysRemaining = 0
+
+# Validate threshold ordering before anything else.  A nonsensical pair must not silently choose a state.
+IF ($CriticalDaysRemaining -gt $WarningDaysRemaining)
+{
+  $Message = "Configuration error: CriticalDaysRemaining ($CriticalDaysRemaining) is greater than WarningDaysRemaining ($WarningDaysRemaining). Critical must be less than or equal to Warning."
+  $momapi.LogScriptEvent($ScriptName,$EventID,1,"`n ERROR: $Message")
+  $bag.AddValue('Result','Critical')
+  $bag.AddValue('Message',$Message)
+  $bag.AddValue('Thumbprint',$Thumbprint)
+  $bag.AddValue('Store',"$StoreLocation\$StoreName")
+  $bag.AddValue('Subject',$Subject)
+  $bag.AddValue('Issuer',$Issuer)
+  $bag.AddValue('NotAfter',$NotAfter)
+  $bag.AddValue('DaysRemaining',$DaysRemaining)
+  $bag.AddValue('WarningDaysRemaining',$WarningDaysRemaining)
+  $bag.AddValue('CriticalDaysRemaining',$CriticalDaysRemaining)
+  $bag
+  EXIT
+}
+
+$Cert = $null
+$Store = $null
+TRY
+{
+  $Store = New-Object System.Security.Cryptography.X509Certificates.X509Store($StoreName,$StoreLocation)
+  $Store.Open([System.Security.Cryptography.X509Certificates.OpenFlags]::ReadOnly)
+  FOREACH ($Candidate in $Store.Certificates)
+  {
+    IF ($Candidate.Thumbprint -eq $Thumbprint) { $Cert = $Candidate; BREAK }
+  }
+  $Store.Close()
+}
+CATCH
+{
+  IF ($Store -ne $null) { TRY { $Store.Close() } CATCH {} }
+  $Message = "Unable to open or read certificate store ($StoreLocation\$StoreName). Monitoring FAILED - this is not a healthy result. Error: $($_.Exception.Message)"
+  $momapi.LogScriptEvent($ScriptName,$EventID,1,"`n FATAL ERROR: $Message")
+  $bag.AddValue('Result','Critical')
+  $bag.AddValue('Message',$Message)
+  $bag.AddValue('Thumbprint',$Thumbprint)
+  $bag.AddValue('Store',"$StoreLocation\$StoreName")
+  $bag.AddValue('Subject',$Subject)
+  $bag.AddValue('Issuer',$Issuer)
+  $bag.AddValue('NotAfter',$NotAfter)
+  $bag.AddValue('DaysRemaining',$DaysRemaining)
+  $bag.AddValue('WarningDaysRemaining',$WarningDaysRemaining)
+  $bag.AddValue('CriticalDaysRemaining',$CriticalDaysRemaining)
+  $bag
+  EXIT
+}
+
+IF ($Cert -eq $null)
+{
+  # The store was readable but this certificate is gone.  Usually it was replaced and the old one deleted.
+  # The discovery snapshot will delete this instance on its next run.  Until then we report Critical, never Success.
+  $Message = "Certificate with thumbprint ($Thumbprint) is no longer present in ($StoreLocation\$StoreName). It was probably replaced or removed. This object is deleted at the next discovery cycle."
+  $momapi.LogScriptEvent($ScriptName,$EventID,1,"`n ERROR: $Message")
+  $bag.AddValue('Result','Critical')
+  $bag.AddValue('Message',$Message)
+  $bag.AddValue('Thumbprint',$Thumbprint)
+  $bag.AddValue('Store',"$StoreLocation\$StoreName")
+  $bag.AddValue('Subject',$Subject)
+  $bag.AddValue('Issuer',$Issuer)
+  $bag.AddValue('NotAfter',$NotAfter)
+  $bag.AddValue('DaysRemaining',$DaysRemaining)
+  $bag.AddValue('WarningDaysRemaining',$WarningDaysRemaining)
+  $bag.AddValue('CriticalDaysRemaining',$CriticalDaysRemaining)
+  $bag
+  EXIT
+}
+
+$Subject = [string]$Cert.Subject
+$Issuer = [string]$Cert.Issuer
+$NotAfterUtc = $Cert.NotAfter.ToUniversalTime()
+$NotAfter = $NotAfterUtc.ToString("yyyy-MM-ddTHH:mm:ssZ")
+$Now = (Get-Date).ToUniversalTime()
+[int]$DaysRemaining = [math]::Floor(($NotAfterUtc - $Now).TotalDays)
+
+# Exact boundaries:
+#   Critical when DaysRemaining is at or below CriticalDaysRemaining (this is also the expired case, where DaysRemaining is negative)
+#   Warning  when DaysRemaining is above CriticalDaysRemaining and at or below WarningDaysRemaining
+#   Success  when DaysRemaining is above WarningDaysRemaining
+IF ($DaysRemaining -le $CriticalDaysRemaining)
+{
+  $Result = "Critical"
+  IF ($DaysRemaining -lt 0)
+  {
+    $Message = "Certificate EXPIRED $([math]::Abs($DaysRemaining)) day(s) ago on ($NotAfter)."
+  }
+  ELSE
+  {
+    $Message = "Certificate expires in ($DaysRemaining) day(s) on ($NotAfter), at or below the critical threshold of ($CriticalDaysRemaining) day(s)."
+  }
+}
+ELSEIF ($DaysRemaining -le $WarningDaysRemaining)
+{
+  $Result = "Warning"
+  $Message = "Certificate expires in ($DaysRemaining) day(s) on ($NotAfter), at or below the warning threshold of ($WarningDaysRemaining) day(s)."
+}
+ELSE
+{
+  $Result = "Success"
+  $Message = "Certificate expires in ($DaysRemaining) day(s) on ($NotAfter), above the warning threshold of ($WarningDaysRemaining) day(s)."
+}
+
+IF ($Result -eq "Success")
+{
+  $momapi.LogScriptEvent($ScriptName,$EventID,0,"`n $Message `n Thumbprint: ($Thumbprint). `n Subject: ($Subject).")
+}
+ELSE
+{
+  $momapi.LogScriptEvent($ScriptName,$EventID,1,"`n $Result : $Message `n Thumbprint: ($Thumbprint). `n Subject: ($Subject).")
+}
+
+$bag.AddValue('Result',$Result)
+$bag.AddValue('Message',$Message)
+$bag.AddValue('Thumbprint',$Thumbprint)
+$bag.AddValue('Store',"$StoreLocation\$StoreName")
+$bag.AddValue('Subject',$Subject)
+$bag.AddValue('Issuer',$Issuer)
+$bag.AddValue('NotAfter',$NotAfter)
+$bag.AddValue('DaysRemaining',$DaysRemaining)
+$bag.AddValue('WarningDaysRemaining',$WarningDaysRemaining)
+$bag.AddValue('CriticalDaysRemaining',$CriticalDaysRemaining)
+
+# Return all bags
+$bag
+#=================================================================================
+# End MAIN script section
+
+
+# End of script section
+#=================================================================================
+#Log an event for script ending and total execution time.
+$EndTime = Get-Date
+$ScriptTime = ($EndTime - $StartTime).TotalSeconds
+$momapi.LogScriptEvent($ScriptName,$EventID,0,"`n Script Completed. `n Script Runtime: ($ScriptTime) seconds.")
+#=================================================================================
+# End of script
+                </ScriptBody>
+                <Parameters>
+                  <Parameter>
+                    <Name>StoreLocation</Name>
+                    <Value>$Config/StoreLocation$</Value>
+                  </Parameter>
+                  <Parameter>
+                    <Name>StoreName</Name>
+                    <Value>$Config/StoreName$</Value>
+                  </Parameter>
+                  <Parameter>
+                    <Name>Thumbprint</Name>
+                    <Value>$Config/Thumbprint$</Value>
+                  </Parameter>
+                  <Parameter>
+                    <Name>WarningDaysRemaining</Name>
+                    <Value>$Config/WarningDaysRemaining$</Value>
+                  </Parameter>
+                  <Parameter>
+                    <Name>CriticalDaysRemaining</Name>
+                    <Value>$Config/CriticalDaysRemaining$</Value>
+                  </Parameter>
+                </Parameters>
+                <TimeoutSeconds>$Config/TimeoutSeconds$</TimeoutSeconds>
+              </ProbeAction>
+            </MemberModules>
+            <Composition>
+              <Node ID="PA">
+                <Node ID="Scheduler" />
+              </Node>
+            </Composition>
+          </Composite>
+        </ModuleImplementation>
+        <OutputType>System!System.PropertyBagData</OutputType>
+      </DataSourceModuleType>
+    </ModuleTypes>
+    <MonitorTypes>
+      <UnitMonitorType ID="##CompanyID##.##AppName##.##UniqueID##.Certificate.Expiration.MonitorType" Accessibility="Internal">
+        <MonitorTypeStates>
+          <MonitorTypeState ID="Success" NoDetection="false" />
+          <MonitorTypeState ID="Warning" NoDetection="false" />
+          <MonitorTypeState ID="Error" NoDetection="false" />
+        </MonitorTypeStates>
+        <Configuration>
+          <xsd:element minOccurs="1" name="IntervalSeconds" type="xsd:integer" xmlns:xsd="http://www.w3.org/2001/XMLSchema" />
+          <xsd:element minOccurs="0" name="SyncTime" type="xsd:string" xmlns:xsd="http://www.w3.org/2001/XMLSchema" />
+          <xsd:element minOccurs="1" name="StoreLocation" type="xsd:string" xmlns:xsd="http://www.w3.org/2001/XMLSchema" />
+          <xsd:element minOccurs="1" name="StoreName" type="xsd:string" xmlns:xsd="http://www.w3.org/2001/XMLSchema" />
+          <xsd:element minOccurs="1" name="Thumbprint" type="xsd:string" xmlns:xsd="http://www.w3.org/2001/XMLSchema" />
+          <xsd:element minOccurs="1" name="WarningDaysRemaining" type="xsd:integer" xmlns:xsd="http://www.w3.org/2001/XMLSchema" />
+          <xsd:element minOccurs="1" name="CriticalDaysRemaining" type="xsd:integer" xmlns:xsd="http://www.w3.org/2001/XMLSchema" />
+          <xsd:element minOccurs="1" name="TimeoutSeconds" type="xsd:integer" xmlns:xsd="http://www.w3.org/2001/XMLSchema" />
+        </Configuration>
+        <OverrideableParameters>
+          <OverrideableParameter ID="IntervalSeconds" Selector="$Config/IntervalSeconds$" ParameterType="int" />
+          <OverrideableParameter ID="SyncTime" Selector="$Config/SyncTime$" ParameterType="string" />
+          <OverrideableParameter ID="WarningDaysRemaining" Selector="$Config/WarningDaysRemaining$" ParameterType="int" />
+          <OverrideableParameter ID="CriticalDaysRemaining" Selector="$Config/CriticalDaysRemaining$" ParameterType="int" />
+          <OverrideableParameter ID="TimeoutSeconds" Selector="$Config/TimeoutSeconds$" ParameterType="int" />
+        </OverrideableParameters>
+        <MonitorImplementation>
+          <MemberModules>
+            <DataSource ID="DS" TypeID="##CompanyID##.##AppName##.##UniqueID##.Certificate.Expiration.Monitor.DS">
+              <IntervalSeconds>$Config/IntervalSeconds$</IntervalSeconds>
+              <SyncTime>$Config/SyncTime$</SyncTime>
+              <StoreLocation>$Config/StoreLocation$</StoreLocation>
+              <StoreName>$Config/StoreName$</StoreName>
+              <Thumbprint>$Config/Thumbprint$</Thumbprint>
+              <WarningDaysRemaining>$Config/WarningDaysRemaining$</WarningDaysRemaining>
+              <CriticalDaysRemaining>$Config/CriticalDaysRemaining$</CriticalDaysRemaining>
+              <TimeoutSeconds>$Config/TimeoutSeconds$</TimeoutSeconds>
+            </DataSource>
+            <ConditionDetection ID="SuccessFilter" TypeID="System!System.ExpressionFilter">
+              <Expression>
+                <SimpleExpression>
+                  <ValueExpression>
+                    <XPathQuery Type="String">Property[@Name='Result']</XPathQuery>
+                  </ValueExpression>
+                  <Operator>Equal</Operator>
+                  <ValueExpression>
+                    <Value Type="String">Success</Value>
+                  </ValueExpression>
+                </SimpleExpression>
+              </Expression>
+            </ConditionDetection>
+            <ConditionDetection ID="WarningFilter" TypeID="System!System.ExpressionFilter">
+              <Expression>
+                <SimpleExpression>
+                  <ValueExpression>
+                    <XPathQuery Type="String">Property[@Name='Result']</XPathQuery>
+                  </ValueExpression>
+                  <Operator>Equal</Operator>
+                  <ValueExpression>
+                    <Value Type="String">Warning</Value>
+                  </ValueExpression>
+                </SimpleExpression>
+              </Expression>
+            </ConditionDetection>
+            <ConditionDetection ID="ErrorFilter" TypeID="System!System.ExpressionFilter">
+              <Expression>
+                <SimpleExpression>
+                  <ValueExpression>
+                    <XPathQuery Type="String">Property[@Name='Result']</XPathQuery>
+                  </ValueExpression>
+                  <Operator>Equal</Operator>
+                  <ValueExpression>
+                    <Value Type="String">Critical</Value>
+                  </ValueExpression>
+                </SimpleExpression>
+              </Expression>
+            </ConditionDetection>
+            <!-- The script always emits Result as exactly Success, Warning or Critical, including for store read failures, a missing certificate and a bad threshold pair, so no data item is left unhandled -->
+          </MemberModules>
+          <RegularDetections>
+            <RegularDetection MonitorTypeStateID="Success">
+              <Node ID="SuccessFilter">
+                <Node ID="DS" />
+              </Node>
+            </RegularDetection>
+            <RegularDetection MonitorTypeStateID="Warning">
+              <Node ID="WarningFilter">
+                <Node ID="DS" />
+              </Node>
+            </RegularDetection>
+            <RegularDetection MonitorTypeStateID="Error">
+              <Node ID="ErrorFilter">
+                <Node ID="DS" />
+              </Node>
+            </RegularDetection>
+          </RegularDetections>
+          <OnDemandDetections>
+            <OnDemandDetection MonitorTypeStateID="Success">
+              <Node ID="SuccessFilter">
+                <Node ID="DS" />
+              </Node>
+            </OnDemandDetection>
+            <OnDemandDetection MonitorTypeStateID="Warning">
+              <Node ID="WarningFilter">
+                <Node ID="DS" />
+              </Node>
+            </OnDemandDetection>
+            <OnDemandDetection MonitorTypeStateID="Error">
+              <Node ID="ErrorFilter">
+                <Node ID="DS" />
+              </Node>
+            </OnDemandDetection>
+          </OnDemandDetections>
+        </MonitorImplementation>
+      </UnitMonitorType>
+    </MonitorTypes>
+  </TypeDefinitions>
+  <Monitoring>
+    <Discoveries>
+      <Discovery ID="##CompanyID##.##AppName##.##UniqueID##.Certificate.Discovery" Target="Windows!Microsoft.Windows.Server.OperatingSystem" Enabled="true" ConfirmDelivery="false" Remotable="true" Priority="Normal">
+      <!-- We choose Microsoft.Windows.Server.OperatingSystem as the preferred target class to ensure this will run on all Windows Servers, but will not create duplicates on clusters -->
+        <Category>Discovery</Category>
+        <DiscoveryTypes>
+          <DiscoveryClass TypeID="##CompanyID##.##AppName##.##UniqueID##.Certificate.Class">
+            <Property PropertyID="Thumbprint" />
+            <Property PropertyID="StoreLocation" />
+            <Property PropertyID="StoreName" />
+            <Property PropertyID="Subject" />
+            <Property PropertyID="Issuer" />
+            <Property PropertyID="FriendlyName" />
+            <Property PropertyID="SerialNumber" />
+            <Property PropertyID="EnhancedKeyUsage" />
+            <Property PropertyID="NotBefore" />
+            <Property PropertyID="NotAfter" />
+          </DiscoveryClass>
+        </DiscoveryTypes>
+        <DataSource ID="DS" TypeID="##CompanyID##.##AppName##.##UniqueID##.Certificate.Discovery.DS">
+          <IntervalSeconds>14400</IntervalSeconds>  <!-- 4 hours.  A renewed certificate is picked up within one cycle, and a deleted certificate is removed from SCOM within one cycle -->
+          <SyncTime></SyncTime>
+          <StoreLocation>##StoreLocation##</StoreLocation>
+          <StoreName>##StoreName##</StoreName>
+          <SubjectMatch>##SubjectMatch##</SubjectMatch>  <!-- PowerShell wildcard match.  Use * for every certificate in the store -->
+          <IssuerMatch>##IssuerMatch##</IssuerMatch>  <!-- PowerShell wildcard match.  Use * for every issuer -->
+          <EnhancedKeyUsageMatch>##EnhancedKeyUsageMatch##</EnhancedKeyUsageMatch>  <!-- PowerShell wildcard match against EKU friendly names and OIDs.  Use * to ignore EKU -->
+          <IncludeExpired>true</IncludeExpired>  <!-- true so an already expired certificate is discovered and alerts as Critical instead of silently disappearing -->
+          <DebugLogging>false</DebugLogging>
+          <TimeoutSeconds>120</TimeoutSeconds>
+        </DataSource>
+      </Discovery>
+    </Discoveries>
+    <Monitors>
+      <UnitMonitor ID="##CompanyID##.##AppName##.##UniqueID##.Certificate.Expiration.Monitor" Accessibility="Public" Enabled="true" Target="##CompanyID##.##AppName##.##UniqueID##.Certificate.Class" ParentMonitorID="Health!System.Health.AvailabilityState" Remotable="true" Priority="Normal" TypeID="##CompanyID##.##AppName##.##UniqueID##.Certificate.Expiration.MonitorType" ConfirmDelivery="true">
+        <Category>AvailabilityHealth</Category>
+        <AlertSettings AlertMessage="##CompanyID##.##AppName##.##UniqueID##.Certificate.Expiration.Monitor.AlertMessage">
+          <AlertOnState>Warning</AlertOnState>  <!-- Warning means the alert is raised when the monitor enters Warning or the worse Error state -->
+          <AutoResolve>true</AutoResolve>
+          <AlertPriority>Normal</AlertPriority>
+          <AlertSeverity>MatchMonitorHealth</AlertSeverity>  <!-- The alert severity follows the monitor health, so a Warning state raises a Warning alert and a Critical state raises a Critical alert -->
+          <AlertParameters>
+            <AlertParameter1>$Data/Context/Property[@Name='Subject']$</AlertParameter1>
+            <AlertParameter2>$Data/Context/Property[@Name='Thumbprint']$</AlertParameter2>
+            <AlertParameter3>$Data/Context/Property[@Name='Store']$</AlertParameter3>
+            <AlertParameter4>$Data/Context/Property[@Name='Issuer']$</AlertParameter4>
+            <AlertParameter5>$Data/Context/Property[@Name='NotAfter']$</AlertParameter5>
+            <AlertParameter6>$Data/Context/Property[@Name='DaysRemaining']$</AlertParameter6>
+            <AlertParameter7>$Data/Context/Property[@Name='WarningDaysRemaining']$</AlertParameter7>
+            <AlertParameter8>$Data/Context/Property[@Name='CriticalDaysRemaining']$</AlertParameter8>
+            <AlertParameter9>$Data/Context/Property[@Name='Message']$</AlertParameter9>
+            <AlertParameter10>$Target/Host/Property[Type="Windows!Microsoft.Windows.Computer"]/PrincipalName$</AlertParameter10>
+          </AlertParameters>
+        </AlertSettings>
+        <OperationalStates>
+          <OperationalState ID="Success" MonitorTypeStateID="Success" HealthState="Success" />
+          <OperationalState ID="Warning" MonitorTypeStateID="Warning" HealthState="Warning" />
+          <OperationalState ID="Error" MonitorTypeStateID="Error" HealthState="Error" />
+        </OperationalStates>
+        <Configuration>
+          <IntervalSeconds>##IntervalSeconds##</IntervalSeconds>  <!-- 14400 (4 hours) is plenty.  Certificate validity changes once per day -->
+          <SyncTime></SyncTime>
+          <StoreLocation>$Target/Property[Type="##CompanyID##.##AppName##.##UniqueID##.Certificate.Class"]/StoreLocation$</StoreLocation>
+          <StoreName>$Target/Property[Type="##CompanyID##.##AppName##.##UniqueID##.Certificate.Class"]/StoreName$</StoreName>
+          <Thumbprint>$Target/Property[Type="##CompanyID##.##AppName##.##UniqueID##.Certificate.Class"]/Thumbprint$</Thumbprint>
+          <WarningDaysRemaining>##WarningDaysRemaining##</WarningDaysRemaining>  <!-- DaysRemaining at or below this value, and above CriticalDaysRemaining, is Warning -->
+          <CriticalDaysRemaining>##CriticalDaysRemaining##</CriticalDaysRemaining>  <!-- DaysRemaining at or below this value, including an expired certificate, is Critical -->
+          <TimeoutSeconds>120</TimeoutSeconds>
+        </Configuration>
+      </UnitMonitor>
+    </Monitors>
+  </Monitoring>
+  <Presentation>
+    <StringResources>
+      <StringResource ID="##CompanyID##.##AppName##.##UniqueID##.Certificate.Expiration.Monitor.AlertMessage" />
+    </StringResources>
+  </Presentation>
+  <LanguagePacks>
+    <LanguagePack ID="ENU" IsDefault="true">
+      <DisplayStrings>
+        <!-- Classes -->
+        <DisplayString ElementID="##CompanyID##.##AppName##.##UniqueID##.Certificate.Class">
+          <Name>##CompanyID## ##AppName## ##UniqueID## Certificate</Name>
+          <Description />
+        </DisplayString>
+        <DisplayString ElementID="##CompanyID##.##AppName##.##UniqueID##.Certificate.Class" SubElementID="Thumbprint">
+          <Name>Thumbprint</Name>
+        </DisplayString>
+        <DisplayString ElementID="##CompanyID##.##AppName##.##UniqueID##.Certificate.Class" SubElementID="StoreLocation">
+          <Name>Store Location</Name>
+        </DisplayString>
+        <DisplayString ElementID="##CompanyID##.##AppName##.##UniqueID##.Certificate.Class" SubElementID="StoreName">
+          <Name>Store Name</Name>
+        </DisplayString>
+        <DisplayString ElementID="##CompanyID##.##AppName##.##UniqueID##.Certificate.Class" SubElementID="Subject">
+          <Name>Subject</Name>
+        </DisplayString>
+        <DisplayString ElementID="##CompanyID##.##AppName##.##UniqueID##.Certificate.Class" SubElementID="Issuer">
+          <Name>Issuer</Name>
+        </DisplayString>
+        <DisplayString ElementID="##CompanyID##.##AppName##.##UniqueID##.Certificate.Class" SubElementID="FriendlyName">
+          <Name>Friendly Name</Name>
+        </DisplayString>
+        <DisplayString ElementID="##CompanyID##.##AppName##.##UniqueID##.Certificate.Class" SubElementID="SerialNumber">
+          <Name>Serial Number</Name>
+        </DisplayString>
+        <DisplayString ElementID="##CompanyID##.##AppName##.##UniqueID##.Certificate.Class" SubElementID="EnhancedKeyUsage">
+          <Name>Enhanced Key Usage</Name>
+        </DisplayString>
+        <DisplayString ElementID="##CompanyID##.##AppName##.##UniqueID##.Certificate.Class" SubElementID="NotBefore">
+          <Name>Valid From (UTC)</Name>
+        </DisplayString>
+        <DisplayString ElementID="##CompanyID##.##AppName##.##UniqueID##.Certificate.Class" SubElementID="NotAfter">
+          <Name>Expires (UTC)</Name>
+        </DisplayString>
+        <!-- Discoveries -->
+        <DisplayString ElementID="##CompanyID##.##AppName##.##UniqueID##.Certificate.Discovery">
+          <Name>##CompanyID## ##AppName## ##UniqueID## Certificate Discovery</Name>
+          <Description />
+        </DisplayString>
+        <!-- Monitors -->
+        <DisplayString ElementID="##CompanyID##.##AppName##.##UniqueID##.Certificate.Expiration.Monitor">
+          <Name>##CompanyID## ##AppName## ##UniqueID## Certificate Expiration Monitor</Name>
+          <Description />
+        </DisplayString>
+        <DisplayString ElementID="##CompanyID##.##AppName##.##UniqueID##.Certificate.Expiration.Monitor" SubElementID="Success">
+          <Name>Certificate Valid</Name>
+        </DisplayString>
+        <DisplayString ElementID="##CompanyID##.##AppName##.##UniqueID##.Certificate.Expiration.Monitor" SubElementID="Warning">
+          <Name>Certificate Expiring Soon</Name>
+        </DisplayString>
+        <DisplayString ElementID="##CompanyID##.##AppName##.##UniqueID##.Certificate.Expiration.Monitor" SubElementID="Error">
+          <Name>Certificate Expired Or Unreadable</Name>
+        </DisplayString>
+        <DisplayString ElementID="##CompanyID##.##AppName##.##UniqueID##.Certificate.Expiration.Monitor.AlertMessage">
+          <Name>##CompanyID## ##AppName## ##UniqueID## certificate requires attention</Name>
+          <Description>A monitored certificate is expiring, has expired, or could not be inspected.
+
+Subject: {0}
+Thumbprint: {1}
+Store: {2}
+Issuer: {3}
+Expires (UTC): {4}
+Days remaining: {5}
+Warning threshold (days): {6}
+Critical threshold (days): {7}
+Computer: {9}
+
+{8}</Description>
+        </DisplayString>
+      </DisplayStrings>
+    </LanguagePack>
+  </LanguagePacks>
+</ManagementPackFragment>

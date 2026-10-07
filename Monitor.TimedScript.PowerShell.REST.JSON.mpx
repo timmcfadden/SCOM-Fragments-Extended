@@ -1,0 +1,638 @@
+﻿<ManagementPackFragment SchemaVersion="2.0" xmlns:xsd="http://www.w3.org/2001/XMLSchema">
+<!--
+%%
+Description:
+  A two state MONITOR which runs a timed PowerShell script to call an HTTP(S) REST endpoint and validate a property inside the JSON response
+  The monitor is HEALTHY when the endpoint answers with the expected HTTP status code, returns valid JSON, contains the requested property, and that property equals the expected value
+  CompanyID - is a short abbreviation for your company with NO SPACES OR SPECIAL CHARACTERS ALLOWED
+  AppName - is a short name for your app with NO SPACES OR SPECIAL CHARACTERS ALLOWED
+  ClassID - is the targeted class such as your custom class or Windows!Microsoft.Windows.Server.OperatingSystem
+  UniqueID - Is a unique short description of the monitor purpose (NO SPACES OR SPECIAL CHARACTERS ALLOWED) such as "ApiHealth"
+  URL - the full endpoint to call, such as https://appserver.contoso.com:8443/api/health
+  ExpectedStatusCode - the HTTP status code that means the call succeeded, normally 200
+  JsonPropertyPath - the path to the property to validate inside the JSON response.  See SUPPORTED JSON PROPERTY PATH SYNTAX below
+  ExpectedValue - the value that property must have for the monitor to be healthy, compared as a case insensitive string
+  IntervalSeconds - how often the endpoint is polled
+  RequestTimeoutSeconds - how long a single HTTP request may take before it is abandoned
+  ConsecutiveFailures - the number of consecutive failed checks required before the monitor changes state
+
+  RUNNABLE EXAMPLE - the shipped defaults validate a classic health endpoint that answers:
+      HTTP/1.1 200 OK
+      Content-Type: application/json
+
+      {"status":"healthy","version":"4.2.1","dependencies":{"database":{"status":"up"}}}
+    URL                = https://appserver.contoso.com/api/health
+    ExpectedStatusCode = 200
+    JsonPropertyPath   = status
+    ExpectedValue      = healthy
+    To validate the nested dependency instead, set JsonPropertyPath to dependencies.database.status and ExpectedValue to up
+
+  SUPPORTED JSON PROPERTY PATH SYNTAX:
+    property                    a top level property                          ->  status
+    parent.child                dot separated nesting, any depth              ->  dependencies.database.status
+    property[n]                 zero based array index                        ->  checks[0]
+    parent.property[n].child    indexes may appear at any level               ->  data.checks[2].state
+    $.property                  an optional leading "$." is accepted and ignored
+    Property NAME matching is case insensitive, because that is how PowerShell resolves object properties.
+    Value comparison is a case insensitive STRING comparison, so 200 and "200" both match an ExpectedValue of 200.
+    NOT SUPPORTED: wildcards, filters/predicates, recursive descent (..), quoted names, and property names that contain a dot or a bracket.
+    If the resolved property is itself an object or an array the check fails with FailureType UnexpectedValue, because only scalars can be compared.
+
+  DIAGNOSTIC OUTPUT - the script always reports exactly one FailureType so you can tell these apart in the alert and in the agent event log:
+    ConnectionFailure     no HTTP response at all - DNS, TCP, TLS handshake, certificate rejection, proxy, or request timeout
+    UnexpectedStatusCode  a response arrived but the HTTP status code is not ExpectedStatusCode
+    InvalidJson           the response body could not be parsed as JSON
+    PropertyNotFound      the JSON parsed but JsonPropertyPath does not resolve
+    UnexpectedValue       the property resolved but does not equal ExpectedValue, or it is not a scalar
+    None                  the check succeeded
+
+  SECURITY NOTES:
+    TLS certificate validation is left ENABLED.  This fragment never assigns ServerCertificateValidationCallback and never sets a "trust all certificates" shim.
+      If your endpoint presents an untrusted certificate, fix the trust chain on the agent instead of disabling validation here.
+    NO credentials are embedded anywhere in this fragment.  See OPTIONAL RUN AS AUTHENTICATION below.
+    The alert context deliberately contains the sanitized URL, the HTTP status code, the failure type, the JSON path, the expected value, and the resolved property value truncated to 256 characters.
+      The raw response body is NEVER placed in a propertybag, an alert, or an event.  The URL is sanitized so any userinfo (https://user:pass@host) and any query string are stripped before it is logged or alerted.
+
+  OPTIONAL RUN AS AUTHENTICATION:
+    A Run As profile (##CompanyID##.##AppName##.##UniqueID##.RESTJSON.RunAsProfile) is declared by this fragment and the monitor references it with RunAs.
+    Leave the profile unconfigured and the workflow simply runs under the agent Default Action Account - nothing else changes, so the Run As part is genuinely optional.
+    To use a dedicated identity: import the MP, open Administration - Run As Configuration - Profiles, open this profile, add a Windows Run As Account, and distribute it to the target agents.
+    Then set UseDefaultCredentials to true on the monitor (or by override).  The script passes -UseDefaultCredentials to Invoke-WebRequest, so the endpoint is called with
+      Windows Integrated authentication as the Run As identity.  No password is ever handled by, stored in, or visible to the script.
+    Adding a RunAs profile places the workflow in its own execution context, so do not expect this monitor to cook down with workflows that do not use the same profile.
+
+  TIMEOUT COORDINATION:
+    RequestTimeoutSeconds (the HTTP request) must be comfortably smaller than TimeoutSeconds (the whole PowerShell module), which must be smaller than IntervalSeconds.
+    The shipped values are 30 / 120 / 300.  The script validates this at run time: if RequestTimeoutSeconds is not at least 15 seconds below TimeoutSeconds it is clamped and a warning event is logged,
+      so a hung endpoint always produces a real ConnectionFailure result instead of letting the module get killed on its own timeout with no data item at all.
+
+Version: 1.0
+LastModified: 11-Sep-2026
+%%
+
+In this fragment you need to replace:
+  ##CompanyID##
+  ##AppName##
+  ##ClassID##
+  ##UniqueID##
+  ##URL##
+  ##ExpectedStatusCode##
+  ##JsonPropertyPath##
+  ##ExpectedValue##
+  ##IntervalSeconds##
+  ##RequestTimeoutSeconds##
+  ##ConsecutiveFailures##
+
+This fragment depends on references:
+  RequiredReference: Alias="System", ID="System.Library"
+  RequiredReference: Alias="Windows", ID="Microsoft.Windows.Library"
+  RequiredReference: Alias="Health", ID="System.Health.Library"
+
+@@Author=FragmentLibrary Contributor@@
+-->
+  <TypeDefinitions>
+    <SecureReferences>
+      <SecureReference ID="##CompanyID##.##AppName##.##UniqueID##.RESTJSON.RunAsProfile" Accessibility="Public" Context="System!System.Entity" />
+      <!-- This creates a Run As PROFILE only.  No account and no credential is defined in the management pack.  An operator associates an account with the profile in the SCOM console. -->
+      <!-- If the profile has no associated account the workflow runs as the agent Default Action Account, which is the normal unauthenticated case. -->
+    </SecureReferences>
+    <ModuleTypes>
+      <DataSourceModuleType ID="##CompanyID##.##AppName##.##UniqueID##.RESTJSON.Monitor.DS" Accessibility="Internal" Batching="false">
+        <Configuration>
+          <xsd:element minOccurs="1" name="IntervalSeconds" type="xsd:integer" xmlns:xsd="http://www.w3.org/2001/XMLSchema" />
+          <xsd:element minOccurs="0" name="SyncTime" type="xsd:string" xmlns:xsd="http://www.w3.org/2001/XMLSchema" />
+          <xsd:element minOccurs="1" name="URL" type="xsd:string" xmlns:xsd="http://www.w3.org/2001/XMLSchema" />
+          <xsd:element minOccurs="1" name="ExpectedStatusCode" type="xsd:integer" xmlns:xsd="http://www.w3.org/2001/XMLSchema" />
+          <xsd:element minOccurs="1" name="JsonPropertyPath" type="xsd:string" xmlns:xsd="http://www.w3.org/2001/XMLSchema" />
+          <xsd:element minOccurs="1" name="ExpectedValue" type="xsd:string" xmlns:xsd="http://www.w3.org/2001/XMLSchema" />
+          <xsd:element minOccurs="1" name="RequestTimeoutSeconds" type="xsd:integer" xmlns:xsd="http://www.w3.org/2001/XMLSchema" />
+          <xsd:element minOccurs="1" name="UseDefaultCredentials" type="xsd:boolean" xmlns:xsd="http://www.w3.org/2001/XMLSchema" />
+          <xsd:element minOccurs="1" name="TimeoutSeconds" type="xsd:integer" xmlns:xsd="http://www.w3.org/2001/XMLSchema" />
+        </Configuration>
+        <OverrideableParameters>
+          <OverrideableParameter ID="IntervalSeconds" Selector="$Config/IntervalSeconds$" ParameterType="int" />
+          <OverrideableParameter ID="SyncTime" Selector="$Config/SyncTime$" ParameterType="string" />
+          <OverrideableParameter ID="URL" Selector="$Config/URL$" ParameterType="string" />
+          <OverrideableParameter ID="ExpectedStatusCode" Selector="$Config/ExpectedStatusCode$" ParameterType="int" />
+          <OverrideableParameter ID="JsonPropertyPath" Selector="$Config/JsonPropertyPath$" ParameterType="string" />
+          <OverrideableParameter ID="ExpectedValue" Selector="$Config/ExpectedValue$" ParameterType="string" />
+          <OverrideableParameter ID="RequestTimeoutSeconds" Selector="$Config/RequestTimeoutSeconds$" ParameterType="int" />
+          <OverrideableParameter ID="UseDefaultCredentials" Selector="$Config/UseDefaultCredentials$" ParameterType="bool" />
+          <OverrideableParameter ID="TimeoutSeconds" Selector="$Config/TimeoutSeconds$" ParameterType="int" />
+        </OverrideableParameters>
+        <ModuleImplementation Isolation="Any">
+          <Composite>
+            <MemberModules>
+              <DataSource ID="Scheduler" TypeID="System!System.Scheduler">
+                <Scheduler>
+                  <SimpleReccuringSchedule>
+                    <Interval Unit="Seconds">$Config/IntervalSeconds$</Interval>
+                    <SyncTime>$Config/SyncTime$</SyncTime>
+                  </SimpleReccuringSchedule>
+                  <ExcludeDates />
+                </Scheduler>
+              </DataSource>
+              <ProbeAction ID="PA" TypeID="Windows!Microsoft.Windows.PowerShellPropertyBagTriggerOnlyProbe">
+                <ScriptName>##CompanyID##.##AppName##.##UniqueID##.RESTJSON.Monitor.DS.ps1</ScriptName>
+                <ScriptBody>
+#=================================================================================
+#  Calls an HTTP(S) endpoint and validates one property of the JSON response
+#  Runs on Windows PowerShell 5.1 as hosted by the SCOM agent - no PowerShell 7
+#  only, no external modules, and no third party JSON parser are required
+#
+#  Author:
+#  v1.0
+#=================================================================================
+param([string]$URL,[int]$ExpectedStatusCode,[string]$JsonPropertyPath,[string]$ExpectedValue,[int]$RequestTimeoutSeconds,[string]$UseDefaultCredentials,[int]$ModuleTimeoutSeconds)
+
+
+# Manual Testing section - put stuff here for manually testing script - typically parameters:
+#=================================================================================
+# [string]$URL = "https://appserver.contoso.com/api/health"
+# [int]$ExpectedStatusCode = 200
+# [string]$JsonPropertyPath = "status"
+# [string]$ExpectedValue = "healthy"
+# [int]$RequestTimeoutSeconds = 30
+# [string]$UseDefaultCredentials = "false"
+# [int]$ModuleTimeoutSeconds = 120
+#=================================================================================
+
+
+# Constants section - modify stuff here:
+#=================================================================================
+# Assign script name variable for use in event logging.
+$ScriptName = "##CompanyID##.##AppName##.##UniqueID##.RESTJSON.Monitor.DS.ps1"
+$EventID = "4810"
+# How much of the resolved property value we are willing to publish into an alert
+$MaxValueLength = 256
+# Minimum gap we insist on between the HTTP request timeout and the module timeout
+$TimeoutSafetyMarginSeconds = 15
+#=================================================================================
+
+
+# Starting Script section - All scripts get this
+#=================================================================================
+# Gather the start time of the script
+$StartTime = Get-Date
+#Set variable to be used in logging events
+$whoami = whoami
+# Load MOMScript API
+$momapi = New-Object -comObject MOM.ScriptAPI
+# Load PropertyBag function
+$bag = $momapi.CreatePropertyBag()
+#=================================================================================
+
+
+# Function section
+#=================================================================================
+# Remove any userinfo and any query string from a URL so nothing secret is ever logged or alerted
+FUNCTION Get-SanitizedUrl
+{
+  param([string]$RawUrl)
+  TRY
+  {
+    $Uri = New-Object System.Uri($RawUrl)
+    RETURN ("{0}://{1}{2}{3}" -f $Uri.Scheme, $Uri.Host, $(IF ($Uri.IsDefaultPort) {""} ELSE {":" + $Uri.Port}), $Uri.AbsolutePath)
+  }
+  CATCH
+  {
+    # Not parseable as a URI - fall back to stripping everything after the first ? and anything before an @
+    $Safe = ($RawUrl -split '\?')[0]
+    RETURN ($Safe -replace '//[^/@]*@', '//')
+  }
+}
+
+# Resolve a dotted / indexed property path against an object produced by ConvertFrom-Json
+# Returns a hashtable: Found (bool), Value (object)
+FUNCTION Resolve-JsonPropertyPath
+{
+  param($InputObject,[string]$Path)
+
+  $Result = @{ Found = $false; Value = $null }
+  $Working = $Path.Trim()
+  IF ($Working.StartsWith('$.')) { $Working = $Working.Substring(2) }
+  IF ($Working.StartsWith('$')) { $Working = $Working.Substring(1) }
+  IF ([string]::IsNullOrEmpty($Working)) { RETURN $Result }
+
+  $Current = $InputObject
+  FOREACH ($Segment in ($Working -split '\.'))
+  {
+    IF ([string]::IsNullOrEmpty($Segment)) { RETURN $Result }
+    IF ($Current -eq $null) { RETURN $Result }
+
+    # Split "name[0][1]" into the name and its indexes
+    $Name = ($Segment -split '\[')[0]
+    $Indexes = @([regex]::Matches($Segment,'\[(\d+)\]') | ForEach-Object { [int]$_.Groups[1].Value })
+
+    IF (-NOT [string]::IsNullOrEmpty($Name))
+    {
+      # PSObject property lookup is case insensitive, which is what we document
+      $Prop = $Current.PSObject.Properties[$Name]
+      IF ($Prop -eq $null) { RETURN $Result }
+      $Current = $Prop.Value
+    }
+
+    FOREACH ($Index in $Indexes)
+    {
+      IF ($Current -eq $null) { RETURN $Result }
+      $AsArray = @($Current)
+      IF ($Index -lt 0 -OR $Index -ge $AsArray.Count) { RETURN $Result }
+      $Current = $AsArray[$Index]
+    }
+  }
+
+  $Result.Found = $true
+  $Result.Value = $Current
+  RETURN $Result
+}
+#=================================================================================
+
+
+# Begin MAIN script section
+#=================================================================================
+[string]$SafeUrl = Get-SanitizedUrl -RawUrl $URL
+[string]$Result = "Failure"
+[string]$FailureType = "None"
+[string]$Detail = ""
+[string]$HttpStatusCode = ""
+[string]$ActualValue = ""
+
+# Coordinate the request timeout with the module timeout so a hung endpoint produces a data item instead of a killed module
+IF ($ModuleTimeoutSeconds -gt 0 -AND $RequestTimeoutSeconds -gt ($ModuleTimeoutSeconds - $TimeoutSafetyMarginSeconds))
+{
+  [int]$Clamped = $ModuleTimeoutSeconds - $TimeoutSafetyMarginSeconds
+  IF ($Clamped -lt 5) { $Clamped = 5 }
+  $momapi.LogScriptEvent($ScriptName,$EventID,2,"`n WARNING: RequestTimeoutSeconds ($RequestTimeoutSeconds) is too close to the module TimeoutSeconds ($ModuleTimeoutSeconds). `n Clamping the HTTP request timeout to ($Clamped) seconds. `n Increase TimeoutSeconds or lower RequestTimeoutSeconds to remove this warning.")
+  $RequestTimeoutSeconds = $Clamped
+}
+
+$momapi.LogScriptEvent($ScriptName,$EventID,0,"`n Script is starting. `n Running as ($whoami). `n URL: ($SafeUrl). `n ExpectedStatusCode: ($ExpectedStatusCode). `n JsonPropertyPath: ($JsonPropertyPath). `n RequestTimeoutSeconds: ($RequestTimeoutSeconds).")
+
+# Enable TLS 1.2 (and TLS 1.3 where the platform exposes it) IN ADDITION to whatever the process already allows.
+# We are ONLY widening the allowed protocol list.  Certificate validation stays fully enabled - we never touch ServerCertificateValidationCallback.
+TRY
+{
+  [Net.ServicePointManager]::SecurityProtocol = [Net.ServicePointManager]::SecurityProtocol -bor [Net.SecurityProtocolType]::Tls12
+}
+CATCH
+{
+  $momapi.LogScriptEvent($ScriptName,$EventID,2,"`n WARNING: Unable to add TLS 1.2 to the allowed security protocols. `n Error: $($_.Exception.Message)")
+}
+
+$Response = $null
+TRY
+{
+  $IWRParams = @{
+    Uri = $URL
+    UseBasicParsing = $true
+    TimeoutSec = $RequestTimeoutSeconds
+    Method = 'GET'
+    ErrorAction = 'Stop'
+  }
+  IF ($UseDefaultCredentials.ToUpper() -eq "TRUE") { $IWRParams.Add('UseDefaultCredentials',$true) }
+  $Response = Invoke-WebRequest @IWRParams
+  $HttpStatusCode = [string][int]$Response.StatusCode
+}
+CATCH [System.Net.WebException]
+{
+  $WebEx = $_.Exception
+  IF ($WebEx.Response -ne $null)
+  {
+    # A real HTTP response came back, it just was not a success code
+    $HttpStatusCode = [string][int]$WebEx.Response.StatusCode
+    $FailureType = "UnexpectedStatusCode"
+    $Detail = "The endpoint answered with HTTP status ($HttpStatusCode) but ($ExpectedStatusCode) was expected."
+  }
+  ELSE
+  {
+    # DNS, TCP, TLS handshake, certificate rejection, proxy, or the request timed out - there is no response to inspect
+    $FailureType = "ConnectionFailure"
+    $Detail = "No HTTP response was received. WebExceptionStatus: ($($WebEx.Status)). $($WebEx.Message)"
+  }
+}
+CATCH
+{
+  $FailureType = "ConnectionFailure"
+  $Detail = "The request could not be completed. $($_.Exception.Message)"
+}
+
+IF ($FailureType -eq "None")
+{
+  IF ([int]$HttpStatusCode -ne $ExpectedStatusCode)
+  {
+    $FailureType = "UnexpectedStatusCode"
+    $Detail = "The endpoint answered with HTTP status ($HttpStatusCode) but ($ExpectedStatusCode) was expected."
+  }
+}
+
+$Json = $null
+IF ($FailureType -eq "None")
+{
+  TRY
+  {
+    $Json = $Response.Content | ConvertFrom-Json -ErrorAction Stop
+  }
+  CATCH
+  {
+    $FailureType = "InvalidJson"
+    # We report the parser complaint but never the body itself
+    $Detail = "The response body is not valid JSON. Parser error: $($_.Exception.Message)"
+  }
+}
+
+IF ($FailureType -eq "None")
+{
+  $Resolved = Resolve-JsonPropertyPath -InputObject $Json -Path $JsonPropertyPath
+  IF ($Resolved.Found -ne $true)
+  {
+    $FailureType = "PropertyNotFound"
+    $Detail = "The JSON response parsed correctly but the property path ($JsonPropertyPath) does not exist in it."
+  }
+  ELSEIF ($Resolved.Value -eq $null)
+  {
+    $FailureType = "UnexpectedValue"
+    $ActualValue = "null"
+    $Detail = "The property ($JsonPropertyPath) is null but ($ExpectedValue) was expected."
+  }
+  ELSEIF ($Resolved.Value -is [System.Management.Automation.PSCustomObject] -OR $Resolved.Value -is [System.Array] -OR $Resolved.Value -is [System.Collections.IList])
+  {
+    $FailureType = "UnexpectedValue"
+    $ActualValue = "(object or array)"
+    $Detail = "The property ($JsonPropertyPath) resolved to an object or an array. Only scalar values can be compared - extend the property path to reach a scalar."
+  }
+  ELSE
+  {
+    $ActualValue = [string]$Resolved.Value
+    IF ($ActualValue.Length -gt $MaxValueLength) { $ActualValue = $ActualValue.Substring(0,$MaxValueLength) + "..." }
+    IF ($ActualValue -eq $ExpectedValue)
+    {
+      $Result = "Success"
+      $Detail = "The endpoint returned HTTP ($HttpStatusCode) and ($JsonPropertyPath) = ($ActualValue) as expected."
+    }
+    ELSE
+    {
+      $FailureType = "UnexpectedValue"
+      $Detail = "The property ($JsonPropertyPath) is ($ActualValue) but ($ExpectedValue) was expected."
+    }
+  }
+}
+
+IF ($Result -eq "Success")
+{
+  $momapi.LogScriptEvent($ScriptName,$EventID,0,"`n SUCCESS: $Detail `n URL: ($SafeUrl).")
+}
+ELSE
+{
+  $momapi.LogScriptEvent($ScriptName,$EventID,1,"`n FAILURE ($FailureType): $Detail `n URL: ($SafeUrl).")
+}
+
+# Only sanitized, non sensitive values are placed in the propertybag.  The response body is never added.
+$bag.AddValue('Result',$Result)
+$bag.AddValue('FailureType',$FailureType)
+$bag.AddValue('Detail',$Detail)
+$bag.AddValue('URL',$SafeUrl)
+$bag.AddValue('HttpStatusCode',$HttpStatusCode)
+$bag.AddValue('JsonPropertyPath',$JsonPropertyPath)
+$bag.AddValue('ExpectedValue',$ExpectedValue)
+$bag.AddValue('ActualValue',$ActualValue)
+
+# Return all bags
+$bag
+#=================================================================================
+# End MAIN script section
+
+
+# End of script section
+#=================================================================================
+#Log an event for script ending and total execution time.
+$EndTime = Get-Date
+$ScriptTime = ($EndTime - $StartTime).TotalSeconds
+$momapi.LogScriptEvent($ScriptName,$EventID,0,"`n Script Completed. `n Script Runtime: ($ScriptTime) seconds.")
+#=================================================================================
+# End of script
+                </ScriptBody>
+                <Parameters>
+                  <Parameter>
+                    <Name>URL</Name>
+                    <Value>$Config/URL$</Value>
+                  </Parameter>
+                  <Parameter>
+                    <Name>ExpectedStatusCode</Name>
+                    <Value>$Config/ExpectedStatusCode$</Value>
+                  </Parameter>
+                  <Parameter>
+                    <Name>JsonPropertyPath</Name>
+                    <Value>$Config/JsonPropertyPath$</Value>
+                  </Parameter>
+                  <Parameter>
+                    <Name>ExpectedValue</Name>
+                    <Value>$Config/ExpectedValue$</Value>
+                  </Parameter>
+                  <Parameter>
+                    <Name>RequestTimeoutSeconds</Name>
+                    <Value>$Config/RequestTimeoutSeconds$</Value>
+                  </Parameter>
+                  <Parameter>
+                    <Name>UseDefaultCredentials</Name>
+                    <Value>$Config/UseDefaultCredentials$</Value>
+                  </Parameter>
+                  <Parameter>
+                    <Name>ModuleTimeoutSeconds</Name>
+                    <Value>$Config/TimeoutSeconds$</Value>
+                  </Parameter>
+                </Parameters>
+                <TimeoutSeconds>$Config/TimeoutSeconds$</TimeoutSeconds>
+              </ProbeAction>
+            </MemberModules>
+            <Composition>
+              <Node ID="PA">
+                <Node ID="Scheduler" />
+              </Node>
+            </Composition>
+          </Composite>
+        </ModuleImplementation>
+        <OutputType>System!System.PropertyBagData</OutputType>
+      </DataSourceModuleType>
+    </ModuleTypes>
+    <MonitorTypes>
+      <UnitMonitorType ID="##CompanyID##.##AppName##.##UniqueID##.RESTJSON.Monitor.MonitorType" Accessibility="Internal">
+        <MonitorTypeStates>
+          <MonitorTypeState ID="CheckSucceeded" NoDetection="false" />
+          <MonitorTypeState ID="CheckFailed" NoDetection="false" />
+        </MonitorTypeStates>
+        <Configuration>
+          <xsd:element minOccurs="1" name="IntervalSeconds" type="xsd:integer" xmlns:xsd="http://www.w3.org/2001/XMLSchema" />
+          <xsd:element minOccurs="0" name="SyncTime" type="xsd:string" xmlns:xsd="http://www.w3.org/2001/XMLSchema" />
+          <xsd:element minOccurs="1" name="URL" type="xsd:string" xmlns:xsd="http://www.w3.org/2001/XMLSchema" />
+          <xsd:element minOccurs="1" name="ExpectedStatusCode" type="xsd:integer" xmlns:xsd="http://www.w3.org/2001/XMLSchema" />
+          <xsd:element minOccurs="1" name="JsonPropertyPath" type="xsd:string" xmlns:xsd="http://www.w3.org/2001/XMLSchema" />
+          <xsd:element minOccurs="1" name="ExpectedValue" type="xsd:string" xmlns:xsd="http://www.w3.org/2001/XMLSchema" />
+          <xsd:element minOccurs="1" name="RequestTimeoutSeconds" type="xsd:integer" xmlns:xsd="http://www.w3.org/2001/XMLSchema" />
+          <xsd:element minOccurs="1" name="UseDefaultCredentials" type="xsd:boolean" xmlns:xsd="http://www.w3.org/2001/XMLSchema" />
+          <xsd:element minOccurs="1" name="TimeoutSeconds" type="xsd:integer" xmlns:xsd="http://www.w3.org/2001/XMLSchema" />
+          <xsd:element minOccurs="1" name="ConsecutiveFailures" type="xsd:integer" xmlns:xsd="http://www.w3.org/2001/XMLSchema" />
+        </Configuration>
+        <OverrideableParameters>
+          <OverrideableParameter ID="IntervalSeconds" Selector="$Config/IntervalSeconds$" ParameterType="int" />
+          <OverrideableParameter ID="SyncTime" Selector="$Config/SyncTime$" ParameterType="string" />
+          <OverrideableParameter ID="URL" Selector="$Config/URL$" ParameterType="string" />
+          <OverrideableParameter ID="ExpectedStatusCode" Selector="$Config/ExpectedStatusCode$" ParameterType="int" />
+          <OverrideableParameter ID="JsonPropertyPath" Selector="$Config/JsonPropertyPath$" ParameterType="string" />
+          <OverrideableParameter ID="ExpectedValue" Selector="$Config/ExpectedValue$" ParameterType="string" />
+          <OverrideableParameter ID="RequestTimeoutSeconds" Selector="$Config/RequestTimeoutSeconds$" ParameterType="int" />
+          <OverrideableParameter ID="UseDefaultCredentials" Selector="$Config/UseDefaultCredentials$" ParameterType="bool" />
+          <OverrideableParameter ID="TimeoutSeconds" Selector="$Config/TimeoutSeconds$" ParameterType="int" />
+          <OverrideableParameter ID="ConsecutiveFailures" Selector="$Config/ConsecutiveFailures$" ParameterType="int" />
+        </OverrideableParameters>
+        <MonitorImplementation>
+          <MemberModules>
+            <DataSource ID="DS" TypeID="##CompanyID##.##AppName##.##UniqueID##.RESTJSON.Monitor.DS">
+              <IntervalSeconds>$Config/IntervalSeconds$</IntervalSeconds>
+              <SyncTime>$Config/SyncTime$</SyncTime>
+              <URL>$Config/URL$</URL>
+              <ExpectedStatusCode>$Config/ExpectedStatusCode$</ExpectedStatusCode>
+              <JsonPropertyPath>$Config/JsonPropertyPath$</JsonPropertyPath>
+              <ExpectedValue>$Config/ExpectedValue$</ExpectedValue>
+              <RequestTimeoutSeconds>$Config/RequestTimeoutSeconds$</RequestTimeoutSeconds>
+              <UseDefaultCredentials>$Config/UseDefaultCredentials$</UseDefaultCredentials>
+              <TimeoutSeconds>$Config/TimeoutSeconds$</TimeoutSeconds>
+            </DataSource>
+            <ConditionDetection ID="CheckSucceededFilter" TypeID="System!System.ExpressionFilter">
+              <Expression>
+                <SimpleExpression>
+                  <ValueExpression>
+                    <XPathQuery Type="String">Property[@Name='Result']</XPathQuery>
+                  </ValueExpression>
+                  <Operator>Equal</Operator>
+                  <ValueExpression>
+                    <Value Type="String">Success</Value>
+                  </ValueExpression>
+                </SimpleExpression>
+              </Expression>
+              <!-- No suppression on the healthy side.  A single successful check returns the monitor to Healthy immediately. -->
+            </ConditionDetection>
+            <ConditionDetection ID="CheckFailedFilter" TypeID="System!System.ExpressionFilter">
+              <Expression>
+                <SimpleExpression>
+                  <ValueExpression>
+                    <XPathQuery Type="String">Property[@Name='Result']</XPathQuery>
+                  </ValueExpression>
+                  <Operator>Equal</Operator>
+                  <ValueExpression>
+                    <Value Type="String">Failure</Value>
+                  </ValueExpression>
+                </SimpleExpression>
+              </Expression>
+              <SuppressionSettings>
+                <MatchCount>$Config/ConsecutiveFailures$</MatchCount>
+              </SuppressionSettings>
+            </ConditionDetection>
+            <!-- The script always emits Result as exactly Success or Failure, so the two filters are exhaustive and mutually exclusive. -->
+          </MemberModules>
+          <RegularDetections>
+            <RegularDetection MonitorTypeStateID="CheckSucceeded">
+              <Node ID="CheckSucceededFilter">
+                <Node ID="DS" />
+              </Node>
+            </RegularDetection>
+            <RegularDetection MonitorTypeStateID="CheckFailed">
+              <Node ID="CheckFailedFilter">
+                <Node ID="DS" />
+              </Node>
+            </RegularDetection>
+          </RegularDetections>
+          <OnDemandDetections>
+            <OnDemandDetection MonitorTypeStateID="CheckSucceeded">
+              <Node ID="CheckSucceededFilter">
+                <Node ID="DS" />
+              </Node>
+            </OnDemandDetection>
+            <OnDemandDetection MonitorTypeStateID="CheckFailed">
+              <Node ID="CheckFailedFilter">
+                <Node ID="DS" />
+              </Node>
+            </OnDemandDetection>
+          </OnDemandDetections>
+        </MonitorImplementation>
+      </UnitMonitorType>
+    </MonitorTypes>
+  </TypeDefinitions>
+  <Monitoring>
+    <Monitors>
+      <UnitMonitor ID="##CompanyID##.##AppName##.##UniqueID##.RESTJSON.Monitor" Accessibility="Public" Enabled="true" Target="##ClassID##" ParentMonitorID="Health!System.Health.AvailabilityState" Remotable="true" Priority="Normal" TypeID="##CompanyID##.##AppName##.##UniqueID##.RESTJSON.Monitor.MonitorType" ConfirmDelivery="true" RunAs="##CompanyID##.##AppName##.##UniqueID##.RESTJSON.RunAsProfile">
+      <!-- RunAs is OPTIONAL in practice: with no account associated to the profile the workflow runs as the agent Default Action Account.  Remove the RunAs attribute (and the SecureReference above) if you never want the profile to appear in the console. -->
+        <Category>AvailabilityHealth</Category>
+        <AlertSettings AlertMessage="##CompanyID##.##AppName##.##UniqueID##.RESTJSON.Monitor.AlertMessage">
+          <AlertOnState>Error</AlertOnState>  <!-- Warning or Error should match OperationalStates below -->
+          <AutoResolve>true</AutoResolve>
+          <AlertPriority>Normal</AlertPriority>
+          <AlertSeverity>MatchMonitorHealth</AlertSeverity>  <!-- Common options for AlertSeverity are MatchMonitorHealth, Information, Warning, Error -->
+          <AlertParameters>
+            <AlertParameter1>$Data/Context/Property[@Name='FailureType']$</AlertParameter1>
+            <AlertParameter2>$Data/Context/Property[@Name='Detail']$</AlertParameter2>
+            <AlertParameter3>$Data/Context/Property[@Name='URL']$</AlertParameter3>
+            <AlertParameter4>$Data/Context/Property[@Name='HttpStatusCode']$</AlertParameter4>
+            <AlertParameter5>$Data/Context/Property[@Name='JsonPropertyPath']$</AlertParameter5>
+            <AlertParameter6>$Data/Context/Property[@Name='ExpectedValue']$</AlertParameter6>
+            <AlertParameter7>$Data/Context/Property[@Name='ActualValue']$</AlertParameter7>
+          </AlertParameters>
+        </AlertSettings>
+        <OperationalStates>
+          <OperationalState ID="CheckSucceeded" MonitorTypeStateID="CheckSucceeded" HealthState="Success" />
+          <OperationalState ID="CheckFailed" MonitorTypeStateID="CheckFailed" HealthState="Error" />  <!-- HealthState = Warning or Error -->
+        </OperationalStates>
+        <Configuration>
+          <IntervalSeconds>##IntervalSeconds##</IntervalSeconds>  <!-- Must be larger than TimeoutSeconds.  300 is a reasonable starting point for a health endpoint -->
+          <SyncTime></SyncTime>
+          <URL>##URL##</URL>
+          <ExpectedStatusCode>##ExpectedStatusCode##</ExpectedStatusCode>
+          <JsonPropertyPath>##JsonPropertyPath##</JsonPropertyPath>
+          <ExpectedValue>##ExpectedValue##</ExpectedValue>
+          <RequestTimeoutSeconds>##RequestTimeoutSeconds##</RequestTimeoutSeconds>  <!-- Must be at least 15 seconds below TimeoutSeconds or the script clamps it and logs a warning -->
+          <UseDefaultCredentials>false</UseDefaultCredentials>  <!-- Set to true to call the endpoint with Windows Integrated authentication as the Run As identity -->
+          <TimeoutSeconds>120</TimeoutSeconds>  <!-- Whole PowerShell module timeout -->
+          <ConsecutiveFailures>##ConsecutiveFailures##</ConsecutiveFailures>  <!-- Number of consecutive failed checks before the monitor turns unhealthy.  One success always returns it to healthy -->
+        </Configuration>
+      </UnitMonitor>
+    </Monitors>
+  </Monitoring>
+  <Presentation>
+    <StringResources>
+      <StringResource ID="##CompanyID##.##AppName##.##UniqueID##.RESTJSON.Monitor.AlertMessage" />
+    </StringResources>
+  </Presentation>
+  <LanguagePacks>
+    <LanguagePack ID="ENU" IsDefault="true">
+      <DisplayStrings>
+        <DisplayString ElementID="##CompanyID##.##AppName##.##UniqueID##.RESTJSON.RunAsProfile">
+          <Name>##CompanyID## ##AppName## ##UniqueID## REST Endpoint Run As Profile</Name>
+          <Description>Optional. Associate a Windows Run As account with this profile to call the REST endpoint with Windows Integrated authentication. If no account is associated the agent Default Action Account is used.</Description>
+        </DisplayString>
+        <DisplayString ElementID="##CompanyID##.##AppName##.##UniqueID##.RESTJSON.Monitor">
+          <Name>##CompanyID## ##AppName## ##UniqueID## REST JSON Monitor</Name>
+          <Description />
+        </DisplayString>
+        <DisplayString ElementID="##CompanyID##.##AppName##.##UniqueID##.RESTJSON.Monitor" SubElementID="CheckSucceeded">
+          <Name>Check Succeeded</Name>
+        </DisplayString>
+        <DisplayString ElementID="##CompanyID##.##AppName##.##UniqueID##.RESTJSON.Monitor" SubElementID="CheckFailed">
+          <Name>Check Failed</Name>
+        </DisplayString>
+        <DisplayString ElementID="##CompanyID##.##AppName##.##UniqueID##.RESTJSON.Monitor.AlertMessage">
+          <Name>##CompanyID## ##AppName## ##UniqueID## REST endpoint check failed</Name>
+          <Description>The REST endpoint check did not pass.
+
+Failure type: {0}
+Detail: {1}
+URL: {2}
+HTTP status code: {3}
+JSON property path: {4}
+Expected value: {5}
+Actual value: {6}
+
+The raw response body is intentionally not included in this alert.</Description>
+        </DisplayString>
+      </DisplayStrings>
+    </LanguagePack>
+  </LanguagePacks>
+</ManagementPackFragment>
